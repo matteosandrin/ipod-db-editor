@@ -161,6 +161,47 @@ class MetadataTests(unittest.TestCase):
             self.run_cli(['edit', '--input', str(BASE), '--firewire-id', GUID.hex(),
                           '--match', '', '--set', 'rating=80'])
 
+    def test_list_filters_combine_text_numbers_and_flags(self):
+        track = next(t for t in self.tracks if edit.u32(t.header, 0xD0) == 5)
+        pid = edit.persistent_id(track)
+        output = self.run_cli(['list', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                               '--filter', 'title~' + edit.get_text(track, 1)[0].swapcase(),
+                               '--filter', 'media_type&podcast', '--filter', 'year>=0',
+                               '--filter', 'persistent_id=' + pid.lower()])
+        self.assertEqual(len(output.splitlines()), 2)
+        self.assertIn(pid, output)
+        exact = self.run_cli(['list', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                              '--filter', 'media_type=podcast'])
+        self.assertEqual(len(exact.splitlines()), 1)
+        includes = self.run_cli(['list', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                                 '--filter', 'media_type&podcast'])
+        self.assertEqual(len(includes.splitlines()), 5)
+        self.assertEqual(BASE.read_bytes(), self.data)
+
+    def test_filter_operator_semantics(self):
+        track = self.tracks[0]
+        edit.edit_track(track, {'title': 'Caf\u00e9=Live', 'rating': 80, 'remember_position': True}, True)
+        for expression in ['title=CAF\u00c9=LIVE', 'title~f\u00e9=', 'title!=Other', 'title!~Other',
+                           'rating>79', 'rating>=80', 'rating<81', 'rating<=80', 'rating!=0',
+                           'rating=0x50', 'remember_position=true', 'track_id=' + str(edit.u32(track.header, 16)),
+                           'location=' + edit.get_text(track, 2)[0]]:
+            self.assertTrue(edit.matches_filter(track, edit.parse_filter(expression)), expression)
+        for expression in ['title=Live', 'title!~live', 'rating>80', 'rating<80', 'rating!=80',
+                           'remember_position=false']:
+            self.assertFalse(edit.matches_filter(track, edit.parse_filter(expression)), expression)
+        missing = next(t for t in self.tracks if edit.get_text(t, 8)[1] is None)
+        self.assertTrue(edit.matches_filter(missing, edit.parse_filter('comment=')))
+
+    def test_invalid_filters_and_edit_mode_rejected(self):
+        for expression in ['title', 'unknown=x', 'year~20', 'title>abc', 'rating=nope',
+                           'rating&1', 'media_type=-music', 'media_type=unknown']:
+            with self.assertRaises(ValueError, msg=expression):
+                edit.parse_filter(expression)
+        with self.assertRaises(ValueError):
+            self.run_cli(['edit', '--filter', 'title~anything'])
+        with self.assertRaises(ValueError):
+            self.run_cli(['list', '--input', '/nonexistent', '--filter', 'unknown=x'])
+
     def test_json_batch_and_real_output(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'edits.json'

@@ -314,6 +314,63 @@ def media_type(value, current):
     return result
 
 
+def attribute(track, field):
+    if field in TEXT or field == 'location':
+        return get_text(track, TEXT[field] if field in TEXT else 2)[0]
+    if field == 'persistent_id':
+        return persistent_id(track)
+    offset, fmt = (0x10, 'I') if field == 'track_id' else NUMBER[field][:2]
+    return struct.unpack_from('<' + fmt, track.header, offset)[0]
+
+
+def parse_filter(expression):
+    match = re.fullmatch(r'([a-z_][a-z_0-9]*)\s*(!~|!=|>=|<=|=|~|>|<|&)(.*)', expression, re.DOTALL)
+    if not match:
+        raise ValueError('Use --filter FIELD=VALUE (or !=, ~, !~, >, >=, <, <=, &)')
+    field, op, value = match.groups()
+    if field not in set(TEXT) | set(NUMBER) | {'location', 'track_id', 'persistent_id'}:
+        raise ValueError('Unknown filter attribute: ' + field)
+    text = field in TEXT or field in {'location', 'persistent_id'}
+    if text:
+        if op not in {'=', '!=', '~', '!~'}:
+            raise ValueError('Text filters support =, !=, ~ and !~')
+        value = value.casefold()
+    else:
+        if op in {'~', '!~'} or (op == '&' and field != 'media_type'):
+            raise ValueError('Numeric filters support comparisons; & is for media_type only')
+        if field == 'media_type':
+            if any(token.strip().startswith(('+', '-')) for token in value.split(',')):
+                raise ValueError('Media type filters require absolute names or numeric masks')
+            value = media_type(value, 0)
+        else:
+            value = integer(value)
+    return field, op, value
+
+
+def matches_filter(track, condition):
+    field, op, wanted = condition
+    actual = attribute(track, field)
+    if isinstance(actual, str):
+        actual = actual.casefold()
+    if op == '=':
+        return actual == wanted
+    if op == '!=':
+        return actual != wanted
+    if op == '~':
+        return wanted in actual
+    if op == '!~':
+        return wanted not in actual
+    if op == '>':
+        return actual > wanted
+    if op == '>=':
+        return actual >= wanted
+    if op == '<':
+        return actual < wanted
+    if op == '<=':
+        return actual <= wanted
+    return (actual & wanted) == wanted
+
+
 def edit_track(track, changes, experimental):
     report = []
     for field, value in changes.items():
@@ -358,17 +415,23 @@ def main():
     parser.add_argument('--firewire-id')
     parser.add_argument('--id', action='append', default=[], help='Persistent hex ID shown by list; repeatable')
     parser.add_argument('--match', help='Case-insensitive title substring')
+    parser.add_argument('--filter', action='append', default=[], metavar='FIELD=VALUE',
+                        help='List only: attribute comparison; repeat to require all filters')
     parser.add_argument('--podcasts', action='store_true', help='Select all existing audio podcasts')
     parser.add_argument('--all-matches', action='store_true', help='Allow --match to select more than one track')
     parser.add_argument('--set', action='append', default=[], metavar='FIELD=VALUE')
     parser.add_argument('--edits', type=Path, help='JSON array of {id, set} objects; cannot combine with selectors')
     parser.add_argument('--experimental', action='store_true', help='Allow edits that may leave derived indexes stale')
     args = parser.parse_args()
+    if args.filter and args.action != 'list':
+        raise ValueError('--filter is supported in list mode only')
+    filters = [parse_filter(value) for value in args.filter]
     if args.action == 'fields':
         print('Numeric: ' + ', '.join(NUMBER))
         print('Media types: ' + ', '.join(MEDIA_TYPES))
         print('media_type accepts a number, comma-separated names, or signed flags: -music,+podcast')
         print('Text: ' + ', '.join(TEXT))
+        print('Additional list attributes: track_id, persistent_id, location')
         print('Experimental: ' + ', '.join(sorted(EXPERIMENTAL)))
         return
     data = args.input.read_bytes()
@@ -381,7 +444,8 @@ def main():
         raise ValueError('Persistent ID not found: ' + ', '.join(requested - by_id.keys()))
     selected = [t for t in tracks if (not requested or persistent_id(t) in requested)
                 and (args.match is None or args.match.casefold() in get_text(t, 1)[0].casefold())
-                and (not args.podcasts or u32(t.header, 0xD0) in (4, 5))]
+                and (not args.podcasts or u32(t.header, 0xD0) in (4, 5))
+                and all(matches_filter(t, condition) for condition in filters)]
     if args.action == 'list':
         print('PERSISTENT ID     TYPE  TITLE')
         for t in selected:
