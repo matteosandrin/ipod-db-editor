@@ -31,6 +31,19 @@ python3 ipod_metadata.py list \
 
 The ID shown is the track's persistent ID, preserved across the iOpenPod rewrites. Use it instead of a row number or the numeric track ID that iOpenPod reassigned. A connected iPod is the default input if `--input` is omitted. The device GUID can be read automatically from an adjacent `Device/SysInfo` or the default mounted iPod; supply the explicit GUID for standalone copies or if it cannot be detected.
 
+## View one track's fields
+
+```sh
+python3 ipod_metadata.py view \
+  --input evidence/before-edits.iTunesDB \
+  --firewire-id 000A27002503D1F0 \
+  --id A242151529FFD1D0
+```
+
+`view` prints a JSON object containing every supported text and numeric metadata field, the persistent and numeric track IDs, and the file location. Media type is displayed as a number, hex value, decoded flag names and any unknown bits. Missing text fields display as empty strings, as they do in filters. This displays the editor's known fields, not undocumented binary fields.
+
+You can select by `--match` or repeatable `--filter` options instead. For example, replace `--id ...` with `--match 'Wanta Fanda'` when reading the edited candidate. Exactly one track must match; zero or multiple matches produce an error. `--all-matches` does not bypass this requirement. `view` is read-only and rejects editing/output options.
+
 ## Filter by attributes in list mode
 
 Use repeatable `--filter` options for any supported text or numeric field, plus `track_id`, `persistent_id` and `location`. All filters must match (AND), including existing `--id`, `--match` and `--podcasts` selectors.
@@ -47,7 +60,7 @@ python3 ipod_metadata.py list \
 - Media types: `--filter 'media_type=podcast'` matches exactly `0x04`; `--filter 'media_type&podcast'` matches any track with the podcast bit, including music+podcast and video+podcast. Comma-separated names work too; `&` requires all specified bits. Signed edit operations are not allowed in filters.
 - Quote expressions so the shell does not interpret `<`, `>` or `&`. Text after the operator is literal, including spaces and equals signs.
 
-Filters only select rows; they do not modify the database. They are supported in `list` mode only. Use `fields` to see the available attributes. Unknown fields or invalid operators fail with an error, even if there would be no matching tracks.
+Filters only select rows; they do not modify the database. They are supported in `list` and `view` modes. Use `fields` to see the available attributes. Unknown fields or invalid operators fail with an error, even if there would be no matching tracks.
 
 ## Edit a title
 
@@ -134,6 +147,6 @@ For the existing warning, the useful controlled sequence is: confirm Finder acce
 
 ## Validation
 
-Run `python3 -m unittest -v test_ipod_metadata` from this folder. The 16 tests use the saved evidence and local temporary files, without writing to the iPod. They cover exact no-op round trips and signatures for all three copies, four-byte-only podcast changes, Unicode string growth/shrink, preservation of unrelated records, adding missing text, scalar edits, malformed data, incorrect GUIDs, ambiguous matches, exclusive output and JSON batches.
+Run `python3 -m unittest -v test_ipod_metadata` from this folder. The 18 tests use the saved evidence and local temporary files, without writing to the iPod. They cover exact no-op round trips and signatures for all three copies, four-byte-only podcast changes, Unicode string growth/shrink, preservation of unrelated records, adding missing text, scalar edits, malformed data, incorrect GUIDs, ambiguous matches, exclusive output and JSON batches.
 
 HASH58 is implemented with the libgpod-documented key derivation. HASH72 retains the original signature's IV/random bytes and recomputes its digest/encryption using OpenSSL; it does not create a new device identity. The tests confirm that signing an unmodified source produces its exact original bytes. Apple's private database validation has not been reproduced.

@@ -202,6 +202,35 @@ class MetadataTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_cli(['list', '--input', '/nonexistent', '--filter', 'unknown=x'])
 
+    def test_view_track_fields_and_combined_media_flags(self):
+        track = next(t for t in self.tracks if edit.u32(t.header, 0xD0) == 5)
+        pid = edit.persistent_id(track)
+        details = json.loads(self.run_cli(['view', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                                          '--id', pid]))
+        self.assertEqual(details['persistent_id'], pid)
+        self.assertEqual(details['title'], edit.get_text(track, 1)[0])
+        self.assertEqual(details['track_id'], edit.u32(track.header, 16))
+        self.assertEqual(details['location'], edit.get_text(track, 2)[0])
+        self.assertEqual(details['media_type'], 5)
+        self.assertEqual(details['media_type_flags'], ['music', 'podcast'])
+        self.assertEqual(details['media_type_unknown_bits'], '0x00000000')
+        self.assertTrue(set(edit.TEXT) | set(edit.NUMBER) <= details.keys())
+        self.assertEqual(BASE.read_bytes(), self.data)
+        filtered = json.loads(self.run_cli(['view', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                                           '--match', details['title'], '--filter', 'media_type&podcast',
+                                           '--filter', 'persistent_id=' + pid]))
+        self.assertEqual(filtered, details)
+
+    def test_view_rejects_ambiguous_missing_and_write_options(self):
+        for selection in [[], ['--match', ''], ['--match', 'NO SUCH TRACK 999999'],
+                          ['--id', 'FFFFFFFFFFFFFFFF'], ['--match', '', '--all-matches'],
+                          ['--match', '', '--set', 'rating=80'],
+                          ['--match', '', '--output', '/tmp/unused-candidate'],
+                          ['--match', '', '--edits', '/tmp/unused-edits']]:
+            with self.assertRaises(ValueError, msg=str(selection)):
+                self.run_cli(['view', '--input', str(BASE), '--firewire-id', GUID.hex()] + selection)
+        self.assertEqual(BASE.read_bytes(), self.data)
+
     def test_json_batch_and_real_output(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'edits.json'

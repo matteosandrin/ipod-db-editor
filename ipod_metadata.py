@@ -409,29 +409,34 @@ def write_exclusive(path, data):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['list', 'edit', 'fields'])
+    parser.add_argument('action', choices=['list', 'view', 'edit', 'fields'])
     parser.add_argument('--input', type=Path, default=Path('/Volumes/iPod/iPod_Control/iTunes/iTunesDB'))
     parser.add_argument('--output', type=Path, help='Write a NEW local file; omit for preview')
     parser.add_argument('--firewire-id')
     parser.add_argument('--id', action='append', default=[], help='Persistent hex ID shown by list; repeatable')
     parser.add_argument('--match', help='Case-insensitive title substring')
     parser.add_argument('--filter', action='append', default=[], metavar='FIELD=VALUE',
-                        help='List only: attribute comparison; repeat to require all filters')
+                        help='List/view: attribute comparison; repeat to require all filters')
     parser.add_argument('--podcasts', action='store_true', help='Select all existing audio podcasts')
     parser.add_argument('--all-matches', action='store_true', help='Allow --match to select more than one track')
     parser.add_argument('--set', action='append', default=[], metavar='FIELD=VALUE')
     parser.add_argument('--edits', type=Path, help='JSON array of {id, set} objects; cannot combine with selectors')
     parser.add_argument('--experimental', action='store_true', help='Allow edits that may leave derived indexes stale')
     args = parser.parse_args()
-    if args.filter and args.action != 'list':
-        raise ValueError('--filter is supported in list mode only')
+    if args.filter and args.action not in {'list', 'view'}:
+        raise ValueError('--filter is supported in list and view modes only')
+    if args.action == 'view':
+        if args.set or args.edits or args.output:
+            raise ValueError('view is read-only; --set, --edits and --output are not supported')
+        if not (args.id or args.match is not None or args.filter or args.podcasts):
+            raise ValueError('Select one track with --id, --match or --filter')
     filters = [parse_filter(value) for value in args.filter]
     if args.action == 'fields':
         print('Numeric: ' + ', '.join(NUMBER))
         print('Media types: ' + ', '.join(MEDIA_TYPES))
         print('media_type accepts a number, comma-separated names, or signed flags: -music,+podcast')
         print('Text: ' + ', '.join(TEXT))
-        print('Additional list attributes: track_id, persistent_id, location')
+        print('Additional list/view attributes: track_id, persistent_id, location')
         print('Experimental: ' + ', '.join(sorted(EXPERIMENTAL)))
         return
     data = args.input.read_bytes()
@@ -446,6 +451,20 @@ def main():
                 and (args.match is None or args.match.casefold() in get_text(t, 1)[0].casefold())
                 and (not args.podcasts or u32(t.header, 0xD0) in (4, 5))
                 and all(matches_filter(t, condition) for condition in filters)]
+    if args.action == 'view':
+        if not selected:
+            raise ValueError('No track matched the selection')
+        if len(selected) != 1:
+            raise ValueError('Selection matched %d tracks; use a persistent ID or narrower filters' % len(selected))
+        track = selected[0]
+        details = {field: attribute(track, field)
+                   for field in ['persistent_id', 'track_id', 'location', *TEXT, *NUMBER]}
+        mask = details['media_type']
+        details['media_type_hex'] = '0x%08X' % mask
+        details['media_type_flags'] = [name for name, bits in MEDIA_TYPES.items() if mask & bits == bits]
+        details['media_type_unknown_bits'] = '0x%08X' % (mask & ~sum(MEDIA_TYPES.values()))
+        print(json.dumps(details, ensure_ascii=False, indent=2))
+        return
     if args.action == 'list':
         print('PERSISTENT ID     TYPE  TITLE')
         for t in selected:
