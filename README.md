@@ -1,25 +1,8 @@
-# Surgical iPod metadata editor
+# iPod Database Editor
 
-`ipod_db_editor.py` edits selected track records while preserving every other byte except enclosing lengths/counts and database signatures. It does not load and rewrite the library through iOpenPod. It needs Python 3.9+ and the macOS `/usr/bin/openssl` executable, with no pip packages or reference checkout dependency.
+`ipod_db_editor.py` edits selected track records in the iPod database, while preserving every other byte except enclosing lengths/counts and database signatures. The goal of this script is to make surgical edits to the iPod database, while preserving the ability to sync with Finder.
 
-**Finder compatibility is not yet verified.** Byte preservation avoids the broad data loss identified in iOpenPod, but cannot prove compatibility with Apple's undocumented checks. This implementation supports the uncompressed version `0x75`, HASH58 database format examined on your Classic. It refuses other versions and invalid input signatures.
-
-## Your podcast correction
-
-A local candidate is already prepared at `candidates/podcasts-only.iTunesDB`, using `evidence/before-edits.iTunesDB` as its baseline. Exactly four non-signature bytes changed: the media type's music bit was cleared on each of the four existing podcasts. File size is unchanged at 985,524 bytes. The candidate is not installed on the iPod.
-
-This uses the earlier saved database because editing the current iOpenPod-written database will not put its missing Apple records back. The candidate therefore does not include later title edits or the three subsequently merged plays.
-
-To preview the correction yourself, run from this folder:
-
-```sh
-python3 ipod_db_editor.py edit \
-  --input evidence/before-edits.iTunesDB \
-  --firewire-id 000A27002503D1F0 \
-  --podcasts --set media_type=podcast --experimental
-```
-
-Omitting `--output` only prints a preview. Add `--output candidates/new-name.iTunesDB` to save a candidate. The output must be a new local file; existing files and mounted device output paths are refused. Originals are never overwritten by this script.
+It needs Python 3.9+ and the macOS `/usr/bin/openssl` executable, with no pip packages or reference checkout dependency.
 
 ## Find a track
 
