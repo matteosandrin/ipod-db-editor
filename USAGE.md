@@ -1,6 +1,6 @@
 # Surgical iPod metadata editor
 
-`ipod_metadata.py` edits selected track records while preserving every other byte except enclosing lengths/counts and database signatures. It does not load and rewrite the library through iOpenPod. It needs Python 3.9+ and the macOS `/usr/bin/openssl` executable, with no pip packages or reference checkout dependency.
+`ipod_db_editor.py` edits selected track records while preserving every other byte except enclosing lengths/counts and database signatures. It does not load and rewrite the library through iOpenPod. It needs Python 3.9+ and the macOS `/usr/bin/openssl` executable, with no pip packages or reference checkout dependency.
 
 **Finder compatibility is not yet verified.** Byte preservation avoids the broad data loss identified in iOpenPod, but cannot prove compatibility with Apple's undocumented checks. This implementation supports the uncompressed version `0x75`, HASH58 database format examined on your Classic. It refuses other versions and invalid input signatures.
 
@@ -13,7 +13,7 @@ This uses the earlier saved database because editing the current iOpenPod-writte
 To preview the correction yourself, run from this folder:
 
 ```sh
-python3 ipod_metadata.py edit \
+python3 ipod_db_editor.py edit \
   --input evidence/before-edits.iTunesDB \
   --firewire-id 000A27002503D1F0 \
   --podcasts --set media_type=podcast --experimental
@@ -24,7 +24,7 @@ Omitting `--output` only prints a preview. Add `--output candidates/new-name.iTu
 ## Find a track
 
 ```sh
-python3 ipod_metadata.py list \
+python3 ipod_db_editor.py list \
   --input evidence/before-edits.iTunesDB \
   --firewire-id 000A27002503D1F0 --match Middlebrow
 ```
@@ -34,7 +34,7 @@ The ID shown is the track's persistent ID, preserved across the iOpenPod rewrite
 ## View one track's fields
 
 ```sh
-python3 ipod_metadata.py view \
+python3 ipod_db_editor.py view \
   --input evidence/before-edits.iTunesDB \
   --firewire-id 000A27002503D1F0 \
   --id A242151529FFD1D0
@@ -49,7 +49,7 @@ You can select by `--match` or repeatable `--filter` options instead. For exampl
 Use repeatable `--filter` options for any supported text or numeric field, plus `track_id`, `persistent_id` and `location`. All filters must match (AND), including existing `--id`, `--match` and `--podcasts` selectors.
 
 ```sh
-python3 ipod_metadata.py list \
+python3 ipod_db_editor.py list \
   --input evidence/before-edits.iTunesDB \
   --firewire-id 000A27002503D1F0 \
   --filter 'artist~Justice' --filter 'year>=2007'
@@ -65,7 +65,7 @@ Filters only select rows; they do not modify the database. They are supported in
 ## Edit a title
 
 ```sh
-python3 ipod_metadata.py edit \
+python3 ipod_db_editor.py edit \
   --input evidence/before-edits.iTunesDB \
   --firewire-id 000A27002503D1F0 \
   --id A242151529FFD1D0 \
@@ -81,7 +81,7 @@ Text edits preserve the existing text encoding and unknown record fields. Longer
 ## Numeric fields and playback options
 
 ```sh
-python3 ipod_metadata.py edit \
+python3 ipod_db_editor.py edit \
   --input evidence/before-edits.iTunesDB \
   --firewire-id 000A27002503D1F0 \
   --id A242151529FFD1D0 \
@@ -108,7 +108,7 @@ Supported numeric fields: rating, track_number, total_tracks, year, disc_number,
 Names: music (1), video (2), podcast (4), audiobook (8), music_video (32), tv_show (64). Numeric masks can represent other bits. Within one assignment, use either absolute values or signed additions/removals. The same strings work in JSON. `--podcasts` is only a track selector; it does not edit a field. There is no separate `podcast_only` database field or editing shortcut.
 
 
-List fields with `python3 ipod_metadata.py fields`. File locations, track IDs, encoded audio properties, artwork and unknown offsets are intentionally not exposed for editing.
+List fields with `python3 ipod_db_editor.py fields`. File locations, track IDs, encoded audio properties, artwork and unknown offsets are intentionally not exposed for editing.
 
 ## Multiple tracks
 
@@ -130,7 +130,7 @@ For different changes on each track, save a JSON file:
 ```
 
 ```sh
-python3 ipod_metadata.py edit \
+python3 ipod_db_editor.py edit \
   --input evidence/before-edits.iTunesDB \
   --firewire-id 000A27002503D1F0 \
   --edits edits.json --experimental \
@@ -147,6 +147,6 @@ For the existing warning, the useful controlled sequence is: confirm Finder acce
 
 ## Validation
 
-Run `python3 -m unittest -v test_ipod_metadata` from this folder. The 18 tests use the saved evidence and local temporary files, without writing to the iPod. They cover exact no-op round trips and signatures for all three copies, four-byte-only podcast changes, Unicode string growth/shrink, preservation of unrelated records, adding missing text, scalar edits, malformed data, incorrect GUIDs, ambiguous matches, exclusive output and JSON batches.
+Run `python3 -m unittest -v test_ipod_db_editor` from this folder. The 18 tests use the saved evidence and local temporary files, without writing to the iPod. They cover exact no-op round trips and signatures for all three copies, four-byte-only podcast changes, Unicode string growth/shrink, preservation of unrelated records, adding missing text, scalar edits, malformed data, incorrect GUIDs, ambiguous matches, exclusive output and JSON batches.
 
 HASH58 is implemented with the libgpod-documented key derivation. HASH72 retains the original signature's IV/random bytes and recomputes its digest/encryption using OpenSSL; it does not create a new device identity. The tests confirm that signing an unmodified source produces its exact original bytes. Apple's private database validation has not been reproduced.

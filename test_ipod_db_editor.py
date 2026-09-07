@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import ipod_metadata as edit
+import ipod_db_editor as edit
 
 ROOT = Path(__file__).parent
 GUID = bytes.fromhex('000A27002503D1F0')
@@ -144,7 +144,7 @@ class MetadataTests(unittest.TestCase):
 
     def run_cli(self, args):
         stream = io.StringIO()
-        with patch.object(sys, 'argv', ['ipod_metadata.py'] + args), contextlib.redirect_stdout(stream):
+        with patch.object(sys, 'argv', ['ipod_db_editor.py'] + args), contextlib.redirect_stdout(stream):
             edit.main()
         return stream.getvalue()
 
