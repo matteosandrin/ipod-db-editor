@@ -445,8 +445,12 @@ def main():
     signature_info = validate_signature(data, guid)
     by_id = {persistent_id(t): t for t in tracks}
     requested = {'%016X' % int(x, 16) for x in args.id}
-    if requested - by_id.keys():
-        raise ValueError('Persistent ID not found: ' + ', '.join(requested - by_id.keys()))
+    missing = sorted(requested - by_id.keys())
+    if missing and args.action != 'edit':
+        raise ValueError('Persistent ID not found: ' + ', '.join(missing))
+    # Edit mode skips missing IDs with a warning so a batch continues.
+    for pid in missing:
+        print('Warning: persistent ID not found, skipped: ' + pid, file=sys.stderr)
     selected = [t for t in tracks if (not requested or persistent_id(t) in requested)
                 and (args.match is None or args.match.casefold() in get_text(t, 1)[0].casefold())
                 and (not args.podcasts or u32(t.header, 0xD0) in (4, 5))
@@ -495,9 +499,13 @@ def main():
         if not isinstance(job, dict) or set(job) != {'id', 'set'} or not isinstance(job['id'], str):
             raise ValueError('Each edit needs a hex string id and a set object')
         pid = '%016X' % int(job['id'], 16)
-        if pid not in by_id or pid in seen or not isinstance(job['set'], dict) or not job['set']:
-            raise ValueError('Unknown/duplicate ID or empty/invalid set object')
+        if pid in seen or not isinstance(job['set'], dict) or not job['set']:
+            raise ValueError('Duplicate ID or empty/invalid set object')
         seen.add(pid)
+        if pid not in by_id:
+            print('Warning: persistent ID not found, skipped: ' + pid, file=sys.stderr)
+            missing.append(pid)
+            continue
         track = by_id[pid]
         title = get_text(track, 1)[0]
         changes = edit_track(track, job['set'], args.experimental)
@@ -509,7 +517,7 @@ def main():
     parse(result)
     report = {'input': str(args.input.resolve()), 'source_sha256': hashlib.sha256(data).hexdigest(),
               'result_sha256': hashlib.sha256(result).hexdigest(), 'source_bytes': len(data),
-              'result_bytes': len(result), 'changes': reports,
+              'result_bytes': len(result), 'changes': reports, 'skipped_ids': missing,
               'finder_tested': False,
               'note': 'Apple indexes, playlists, album tables and preferences are preserved. Text/grouping edits may leave caches stale.'}
     if args.output:

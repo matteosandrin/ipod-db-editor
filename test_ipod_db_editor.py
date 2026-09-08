@@ -243,6 +243,28 @@ class MetadataTests(unittest.TestCase):
             self.assertEqual(tracks[0].header[0x1F], 80)
             self.assertEqual(BASE.read_bytes(), self.data)
 
+    def test_edit_warns_and_skips_missing_ids(self):
+        errors = io.StringIO()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'edits.json'
+            path.write_text(json.dumps([{'id': 'FFFFFFFFFFFFFFFF', 'set': {'rating': 80}},
+                                        {'id': edit.persistent_id(self.tracks[0]), 'set': {'rating': 80}}]))
+            with contextlib.redirect_stderr(errors):
+                report = json.loads(self.run_cli(['edit', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                                                 '--edits', str(path)]))
+        self.assertEqual(len(report['changes']), 1)
+        self.assertEqual(report['skipped_ids'], ['FFFFFFFFFFFFFFFF'])
+        self.assertIn('Warning: persistent ID not found, skipped: FFFFFFFFFFFFFFFF', errors.getvalue())
+        with contextlib.redirect_stderr(errors):
+            report = json.loads(self.run_cli(['edit', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                                             '--id', 'FFFFFFFFFFFFFFFF', '--id', edit.persistent_id(self.tracks[0]),
+                                             '--set', 'rating=80']))
+        self.assertEqual(len(report['changes']), 1)
+        self.assertEqual(report['skipped_ids'], ['FFFFFFFFFFFFFFFF'])
+        with self.assertRaises(ValueError):
+            self.run_cli(['list', '--input', str(BASE), '--firewire-id', GUID.hex(), '--id', 'FFFFFFFFFFFFFFFF'])
+        self.assertEqual(BASE.read_bytes(), self.data)
+
 
 if __name__ == '__main__':
     unittest.main()
