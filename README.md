@@ -78,6 +78,8 @@ Supported text fields: title, album, artist, genre, comment, category, lyrics, c
 
 Supported numeric fields: rating, track_number, total_tracks, year, disc_number, total_discs, bpm, skip_when_shuffling, remember_position, media_type. Media type edits require `--experimental`; they change the database field, not the encoded file format or podcast subscriptions.
 
+Playlist field: podcast_group (see below). It requires `--experimental`.
+
 `media_type` is a bitmask, so it supports exact assignment or changes to selected bits:
 
 ```sh
@@ -92,6 +94,24 @@ Names: music (1), video (2), podcast (4), audiobook (8), music_video (32), tv_sh
 
 
 List fields with `python3 ipod_db_editor.py fields`. File locations, track IDs, encoded audio properties, artwork and unknown offsets are intentionally not exposed for editing.
+
+## Podcast group links
+
+The iPod's Podcasts menu does not group episodes by album or artist. It reads the Podcasts playlist in the database, which holds one group-header entry per podcast and, for each episode entry, a reference to its header. An episode whose reference is 0 is shown under a fallback group named "Root", even when a header with the right name exists. Finder has been observed writing such unlinked entries.
+
+```sh
+python3 ipod_db_editor.py list --podcasts --filter 'podcast_group='
+
+python3 ipod_db_editor.py edit \
+  --input evidence/unlinked-groups.iTunesDB \
+  --firewire-id 000A27002503D1F0 \
+  --id 5F413F281B4090BF \
+  --set podcast_group=Middlebrow \
+  --experimental \
+  --output candidates/relinked.iTunesDB
+```
+
+`podcast_group` is the title of the episode's group header, or an empty string when the episode is unlinked or not in the Podcasts playlist. It appears in `view` and can be filtered like a text field. Setting it patches the four-byte reference in the episode's playlist entry so it points at the existing header with that title (case-insensitive). The header must already exist; this tool does not create group headers, and it does not add tracks to the playlist. Only the type-3 playlist dataset, which the iPod Classic reads, is patched.
 
 ## Multiple tracks
 
@@ -130,6 +150,6 @@ For the existing warning, the useful controlled sequence is: confirm Finder acce
 
 ## Validation
 
-Run `python3 -m unittest -v test_ipod_db_editor` from this folder. The 18 tests use the saved evidence and local temporary files, without writing to the iPod. They cover exact no-op round trips and signatures for all three copies, four-byte-only podcast changes, Unicode string growth/shrink, preservation of unrelated records, adding missing text, scalar edits, malformed data, incorrect GUIDs, ambiguous matches, exclusive output and JSON batches.
+Run `python3 -m unittest -v test_ipod_db_editor` from this folder. The 20 tests use the saved evidence and local temporary files, without writing to the iPod. They cover exact no-op round trips and signatures for all four copies, four-byte-only podcast changes, Unicode string growth/shrink, preservation of unrelated records, adding missing text, scalar edits, podcast group links, malformed data, incorrect GUIDs, ambiguous matches, exclusive output and JSON batches.
 
 HASH58 is implemented with the libgpod-documented key derivation. HASH72 retains the original signature's IV/random bytes and recomputes its digest/encryption using OpenSSL; it does not create a new device identity. The tests confirm that signing an unmodified source produces its exact original bytes. Apple's private database validation has not been reproduced.

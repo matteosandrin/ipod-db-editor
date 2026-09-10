@@ -14,6 +14,7 @@ import ipod_db_editor as edit
 ROOT = Path(__file__).parent
 GUID = bytes.fromhex('000A27002503D1F0')
 BASE = ROOT / 'evidence/before-edits.iTunesDB'
+UNLINKED = ROOT / 'evidence/unlinked-groups.iTunesDB'
 
 
 class MetadataTests(unittest.TestCase):
@@ -23,7 +24,7 @@ class MetadataTests(unittest.TestCase):
         self.signature = edit.validate_signature(self.data, GUID)
 
     def test_exact_noop_and_signatures_on_all_evidence(self):
-        for name in ['before-edits', 'latest-backup', 'current']:
+        for name in ['before-edits', 'latest-backup', 'current', 'unlinked-groups']:
             data = (ROOT / 'evidence' / (name + '.iTunesDB')).read_bytes()
             root, _ = edit.parse(data)
             self.assertEqual(root.render(), data)
@@ -264,6 +265,61 @@ class MetadataTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_cli(['list', '--input', str(BASE), '--firewire-id', GUID.hex(), '--id', 'FFFFFFFFFFFFFFFF'])
         self.assertEqual(BASE.read_bytes(), self.data)
+
+    def test_podcast_group_view_filter_and_link(self):
+        data = UNLINKED.read_bytes()
+        root, tracks = edit.parse(data)
+        playlist = edit.PodcastPlaylist.load(root)
+        self.assertEqual(sorted(playlist.groups.values()), ['Acquired', 'Decoder Ring', 'Middlebrow'])
+        by_title = {edit.get_text(t, 1)[0]: t for t in tracks}
+        orphan = by_title['MrBeast Literary Society']
+        pid = edit.persistent_id(orphan)
+        self.assertEqual(playlist.group_of(by_title['Vanguard']), 'Acquired')
+        self.assertEqual(playlist.group_of(orphan), '')
+        cli = ['--input', str(UNLINKED), '--firewire-id', GUID.hex()]
+        unlinked = self.run_cli(['list', *cli, '--podcasts', '--filter', 'podcast_group='])
+        self.assertEqual(len(unlinked.splitlines()), 3)
+        self.assertIn(pid, unlinked)
+        self.assertEqual(len(self.run_cli(['list', *cli, '--filter', 'podcast_group=acquired']).splitlines()), 3)
+        self.assertEqual(json.loads(self.run_cli(['view', *cli, '--id', pid]))['podcast_group'], '')
+        with self.assertRaises(ValueError):
+            edit.edit_track(orphan, {'podcast_group': 'Middlebrow'}, False, playlist)
+        with self.assertRaises(ValueError):
+            edit.edit_track(orphan, {'podcast_group': 'Middlebrow'}, True, None)
+        for value in ['Nope', 1]:
+            with self.assertRaises(ValueError):
+                edit.edit_track(orphan, {'podcast_group': value}, True, playlist)
+        music = next(t for t in tracks if edit.u32(t.header, 0xD0) == 1)
+        with self.assertRaises(ValueError):
+            edit.edit_track(music, {'podcast_group': 'Middlebrow'}, True, playlist)
+        # The playlist dataset bytes are unchanged after the rejected edits.
+        self.assertEqual(root.render(), data)
+        report = edit.edit_track(orphan, {'podcast_group': 'middlebrow'}, True, playlist)
+        self.assertEqual(report, [{'field': 'podcast_group', 'before': '', 'after': 'Middlebrow'}])
+        self.assertEqual(edit.edit_track(orphan, {'podcast_group': 'Middlebrow'}, True, playlist), [])
+        result = edit.sign(root.render(), GUID, edit.validate_signature(data, GUID))
+        self.assertEqual(len(result), len(data))
+        index = root.children.index(playlist.dataset)
+        start = root.hlen + sum(len(c.raw) for c in root.children[:index]) + playlist.dataset.hlen
+        reference = start + playlist.entries[edit.u32(orphan.header, 0x10)]
+        differences = {i for i, (a, b) in enumerate(zip(data, result)) if a != b}
+        patched = differences - set(range(88, 108)) - set(range(114, 160))
+        self.assertTrue(patched)
+        self.assertTrue(patched <= set(range(reference, reference + 4)))
+        root, tracks = edit.parse(result)
+        relinked = next(t for t in tracks if edit.persistent_id(t) == pid)
+        self.assertEqual(edit.PodcastPlaylist.load(root).group_of(relinked), 'Middlebrow')
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder) / 'candidate'
+            report = json.loads(self.run_cli(['edit', *cli, '--id', pid, '--set', 'podcast_group=Middlebrow',
+                                             '--experimental', '--output', str(out)]))
+            self.assertEqual(report['changes'][0]['changes'][0]['after'], 'Middlebrow')
+            self.assertEqual(out.read_bytes(), result)
+            details = json.loads(self.run_cli(['view', '--input', str(out), '--firewire-id', GUID.hex(), '--id', pid]))
+            self.assertEqual(details['podcast_group'], 'Middlebrow')
+        with self.assertRaises(ValueError):
+            self.run_cli(['edit', *cli, '--id', pid, '--set', 'podcast_group=Middlebrow'])
+        self.assertEqual(UNLINKED.read_bytes(), data)
 
 
 if __name__ == '__main__':

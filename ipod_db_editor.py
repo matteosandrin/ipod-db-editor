@@ -37,7 +37,7 @@ MEDIA_TYPES = {
     'music_video': 0x20, 'tv_show': 0x40,
 }
 # These edits can affect indexes, grouping, or other records kept by Apple.
-EXPERIMENTAL = set(TEXT) | {'track_number', 'disc_number', 'media_type'}
+EXPERIMENTAL = set(TEXT) | {'track_number', 'disc_number', 'media_type', 'podcast_group'}
 AES_KEY = '618ca10dc7f57fd3b4723e08157463d7'
 
 
@@ -127,20 +127,118 @@ def persistent_id(track):
     return '%016X' % struct.unpack_from('<Q', track.header, 0x70)[0]
 
 
-def get_text(track, kind):
-    matches = [c for c in track.children if u32(c.header, 12) == kind]
-    if len(matches) > 1:
-        raise ValueError('Duplicate text records; unsupported')
-    if not matches:
-        return '', None
-    c = matches[0]
+def text_of(c):
     if c.hlen != 24 or len(c.body) < 16:
         raise ValueError('Unsupported text record layout')
     encoding = {1: 'utf-16-le', 2: 'utf-8'}.get(u32(c.body, 0))
     size = u32(c.body, 4)
     if not encoding or size > len(c.body) - 16:
         raise ValueError('Unsupported or truncated text encoding')
-    return c.body[16:16 + size].decode(encoding), c
+    return c.body[16:16 + size].decode(encoding)
+
+
+def get_text(track, kind):
+    matches = [c for c in track.children if u32(c.header, 12) == kind]
+    if len(matches) > 1:
+        raise ValueError('Duplicate text records; unsupported')
+    if not matches:
+        return '', None
+    return text_of(matches[0]), matches[0]
+
+
+def record(body, offset, tag):
+    # Return (header length, total length) of the record at offset after a tag check.
+    if offset + 12 > len(body) or body[offset:offset + 4] != tag:
+        raise ValueError('Expected %s record in playlist dataset' % tag.decode())
+    head, size = u32(body, offset + 4), u32(body, offset + 8)
+    if head < 12 or size < head or offset + size > len(body):
+        raise ValueError('Invalid %s record length' % tag.decode())
+    return head, size
+
+
+class PodcastPlaylist:
+    # The Podcasts menu groups episodes by group-header entries in the podcast playlist of the
+    # type-3 playlist dataset, not by album. Each episode entry keeps its header ID at offset 32.
+    def __init__(self, dataset, groups, entries):
+        self.dataset = dataset
+        self.groups = groups  # group ID -> header title
+        self.entries = entries  # numeric track ID -> body offset of the group reference
+
+    @classmethod
+    def load(cls, root):
+        datasets = [c for c in root.children if c.tag == b'mhsd' and u32(c.header, 12) == 3]
+        if len(datasets) != 1:
+            return None
+        dataset = datasets[0]
+        body = dataset.body
+        # Like mhlt, the mhlp header keeps a child count at offset 8 instead of a total length.
+        if len(body) < 12 or body[:4] != b'mhlp' or not 12 <= u32(body, 4) <= len(body):
+            raise ValueError('Playlist dataset has no mhlp')
+        offset, found = u32(body, 4), None
+        for _ in range(u32(body, 8)):
+            head, size = record(body, offset, b'mhyp')
+            if head < 44:
+                raise ValueError('Unsupported playlist header')
+            if struct.unpack_from('<H', body, offset + 42)[0] == 1:
+                if found is not None:
+                    raise ValueError('Multiple podcast playlists; unsupported')
+                found = cls.scan(dataset, offset + head, u32(body, offset + 12), u32(body, offset + 16))
+            offset += size
+        if offset != len(body):
+            raise ValueError('Unparsed bytes in playlist dataset')
+        return found
+
+    @classmethod
+    def scan(cls, dataset, cursor, mhods, mhips):
+        body = dataset.body
+        for _ in range(mhods):
+            cursor += record(body, cursor, b'mhod')[1]
+        groups, entries = {}, {}
+        for _ in range(mhips):
+            head, size = record(body, cursor, b'mhip')
+            if head < 36:
+                raise ValueError('Unsupported podcast playlist entry')
+            group_id, track_id = u32(body, cursor + 20), u32(body, cursor + 24)
+            inner, titles = cursor + head, []
+            for _ in range(u32(body, cursor + 12)):
+                mhod_size = record(body, inner, b'mhod')[1]
+                if u32(body, inner + 12) == 1:
+                    titles.append(text_of(Chunk(body[inner:inner + mhod_size])))
+                inner += mhod_size
+            if inner != cursor + size:
+                raise ValueError('Podcast playlist entry length mismatch')
+            if struct.unpack_from('<H', body, cursor + 16)[0]:
+                if len(titles) != 1 or group_id in groups:
+                    raise ValueError('Invalid podcast group header')
+                groups[group_id] = titles[0]
+            else:
+                if track_id in entries:
+                    raise ValueError('Duplicate podcast playlist entry')
+                entries[track_id] = cursor + 32
+            cursor += size
+        return cls(dataset, groups, entries)
+
+    def group_of(self, track):
+        offset = self.entries.get(u32(track.header, 0x10))
+        if offset is None:
+            return ''
+        return self.groups.get(u32(self.dataset.body, offset), '')
+
+    def link(self, track, name):
+        offset = self.entries.get(u32(track.header, 0x10))
+        if offset is None:
+            raise ValueError('Track is not in the Podcasts playlist; only synced podcast episodes can be linked')
+        ids = [gid for gid, title in self.groups.items() if title == name]
+        if not ids:
+            ids = [gid for gid, title in self.groups.items() if title.casefold() == name.casefold()]
+        if len(ids) != 1:
+            raise ValueError('Podcast group %r not found or ambiguous; existing groups: %s'
+                             % (name, ', '.join(sorted(self.groups.values())) or 'none'))
+        old = self.group_of(track)
+        body = bytearray(self.dataset.body)
+        put32(body, offset, ids[0])
+        self.dataset.body = bytes(body)
+        return old, self.groups[ids[0]]
 
 
 def set_text(track, kind, value):
@@ -314,11 +412,13 @@ def media_type(value, current):
     return result
 
 
-def attribute(track, field):
+def attribute(track, field, playlist=None):
     if field in TEXT or field == 'location':
         return get_text(track, TEXT[field] if field in TEXT else 2)[0]
     if field == 'persistent_id':
         return persistent_id(track)
+    if field == 'podcast_group':
+        return playlist.group_of(track) if playlist else ''
     offset, fmt = (0x10, 'I') if field == 'track_id' else NUMBER[field][:2]
     return struct.unpack_from('<' + fmt, track.header, offset)[0]
 
@@ -328,9 +428,9 @@ def parse_filter(expression):
     if not match:
         raise ValueError('Use --filter FIELD=VALUE (or !=, ~, !~, >, >=, <, <=, &)')
     field, op, value = match.groups()
-    if field not in set(TEXT) | set(NUMBER) | {'location', 'track_id', 'persistent_id'}:
+    if field not in set(TEXT) | set(NUMBER) | {'location', 'track_id', 'persistent_id', 'podcast_group'}:
         raise ValueError('Unknown filter attribute: ' + field)
-    text = field in TEXT or field in {'location', 'persistent_id'}
+    text = field in TEXT or field in {'location', 'persistent_id', 'podcast_group'}
     if text:
         if op not in {'=', '!=', '~', '!~'}:
             raise ValueError('Text filters support =, !=, ~ and !~')
@@ -347,9 +447,9 @@ def parse_filter(expression):
     return field, op, value
 
 
-def matches_filter(track, condition):
+def matches_filter(track, condition, playlist=None):
     field, op, wanted = condition
-    actual = attribute(track, field)
+    actual = attribute(track, field, playlist)
     if isinstance(actual, str):
         actual = actual.casefold()
     if op == '=':
@@ -371,26 +471,30 @@ def matches_filter(track, condition):
     return (actual & wanted) == wanted
 
 
-def edit_track(track, changes, experimental):
+def edit_track(track, changes, experimental, playlist=None):
     report = []
     for field, value in changes.items():
-        if field in TEXT or field in NUMBER:
-            if field in EXPERIMENTAL and not experimental:
-                raise ValueError('%s requires --experimental: derived Apple indexes are preserved, not rebuilt' % field)
-            if field in TEXT:
-                if not isinstance(value, str):
-                    raise ValueError('Text values must be strings')
-                old = set_text(track, TEXT[field], value)
-            else:
-                offset, fmt, minimum, maximum = NUMBER[field]
-                old = struct.unpack_from('<' + fmt, track.header, offset)[0]
-                value = media_type(value, old) if field == 'media_type' else integer(value)
-                if not minimum <= value <= maximum:
-                    raise ValueError('%s must be between %s and %s' % (field, minimum, maximum))
-                old = struct.unpack_from('<' + fmt, track.header, offset)[0]
-                struct.pack_into('<' + fmt, track.header, offset, value)
-        else:
+        if field not in TEXT and field not in NUMBER and field != 'podcast_group':
             raise ValueError('Unknown or unsupported field: ' + field)
+        if field in EXPERIMENTAL and not experimental:
+            raise ValueError('%s requires --experimental: derived Apple indexes are preserved, not rebuilt' % field)
+        if field == 'podcast_group':
+            if not isinstance(value, str):
+                raise ValueError('podcast_group must be the title of an existing group header')
+            if playlist is None:
+                raise ValueError('No podcast playlist found in the type-3 playlist dataset')
+            old, value = playlist.link(track, value)
+        elif field in TEXT:
+            if not isinstance(value, str):
+                raise ValueError('Text values must be strings')
+            old = set_text(track, TEXT[field], value)
+        else:
+            offset, fmt, minimum, maximum = NUMBER[field]
+            old = struct.unpack_from('<' + fmt, track.header, offset)[0]
+            value = media_type(value, old) if field == 'media_type' else integer(value)
+            if not minimum <= value <= maximum:
+                raise ValueError('%s must be between %s and %s' % (field, minimum, maximum))
+            struct.pack_into('<' + fmt, track.header, offset, value)
         if old != value:
             report.append({'field': field, 'before': old, 'after': value})
     return report
@@ -436,11 +540,13 @@ def main():
         print('Media types: ' + ', '.join(MEDIA_TYPES))
         print('media_type accepts a number, comma-separated names, or signed flags: -music,+podcast')
         print('Text: ' + ', '.join(TEXT))
-        print('Additional list/view attributes: track_id, persistent_id, location')
+        print('Additional list/view attributes: track_id, persistent_id, location, podcast_group')
+        print('podcast_group links a synced episode to an existing Podcasts-menu group header by title')
         print('Experimental: ' + ', '.join(sorted(EXPERIMENTAL)))
         return
     data = args.input.read_bytes()
     root, tracks = parse(data)
+    playlist = PodcastPlaylist.load(root)
     guid = device_guid(args.firewire_id, args.input)
     signature_info = validate_signature(data, guid)
     by_id = {persistent_id(t): t for t in tracks}
@@ -454,15 +560,15 @@ def main():
     selected = [t for t in tracks if (not requested or persistent_id(t) in requested)
                 and (args.match is None or args.match.casefold() in get_text(t, 1)[0].casefold())
                 and (not args.podcasts or u32(t.header, 0xD0) in (4, 5))
-                and all(matches_filter(t, condition) for condition in filters)]
+                and all(matches_filter(t, condition, playlist) for condition in filters)]
     if args.action == 'view':
         if not selected:
             raise ValueError('No track matched the selection')
         if len(selected) != 1:
             raise ValueError('Selection matched %d tracks; use a persistent ID or narrower filters' % len(selected))
         track = selected[0]
-        details = {field: attribute(track, field)
-                   for field in ['persistent_id', 'track_id', 'location', *TEXT, *NUMBER]}
+        details = {field: attribute(track, field, playlist)
+                   for field in ['persistent_id', 'track_id', 'location', 'podcast_group', *TEXT, *NUMBER]}
         mask = details['media_type']
         details['media_type_hex'] = '0x%08X' % mask
         details['media_type_flags'] = [name for name, bits in MEDIA_TYPES.items() if mask & bits == bits]
@@ -508,7 +614,7 @@ def main():
             continue
         track = by_id[pid]
         title = get_text(track, 1)[0]
-        changes = edit_track(track, job['set'], args.experimental)
+        changes = edit_track(track, job['set'], args.experimental, playlist)
         if changes:
             reports.append({'id': pid, 'title': title, 'changes': changes})
     result = root.render()
@@ -519,7 +625,7 @@ def main():
               'result_sha256': hashlib.sha256(result).hexdigest(), 'source_bytes': len(data),
               'result_bytes': len(result), 'changes': reports, 'skipped_ids': missing,
               'finder_tested': False,
-              'note': 'Apple indexes, playlists, album tables and preferences are preserved. Text/grouping edits may leave caches stale.'}
+              'note': 'Apple indexes, album tables, preferences and playlists are preserved, except podcast_group links edited here. Text/grouping edits may leave caches stale.'}
     if args.output:
         if args.output.resolve() == args.input.resolve():
             raise ValueError('Input and output must differ')
