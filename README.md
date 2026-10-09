@@ -1,188 +1,89 @@
 # iPod Database Editor
 
-`ipod-db-editor` edits selected track records in the iPod database, while preserving every other byte except enclosing lengths/counts and database signatures. The goal of this tool is to make surgical edits to the iPod database, while preserving the ability to sync with Finder.
+Edit track metadata directly in an iPod Classic's `iTunesDB`, without breaking Finder sync.
 
-It needs Python 3.9+ and the macOS `/usr/bin/openssl` executable, with no third-party pip dependencies.
+Requires macOS and Python 3.9+. No other dependencies.
 
 ## Install
 
 ```sh
-pipx install .          # or: pip install .
-pip install -e .        # editable install for development
+pip install .
 ```
 
-This installs the `ipod-db-editor` command. `python3 -m ipod_db_editor` works too.
+## Quick start
+
+With your iPod connected:
+
+```sh
+ipod-db-editor list --match "sultans of swing"                              # find tracks by title
+ipod-db-editor set media_type=music --match "sultans of swing"              # preview a change
+ipod-db-editor set media_type=music --match "sultans of swing" --in-place   # apply it
+```
+
+`--in-place` backs up the current database to `~/Library/Application Support/ipod-db-editor/backups/` before writing.
 
 ## Commands
 
-```
-ipod-db-editor fields                                  # every field, its type, and whether it is editable
-ipod-db-editor list  [SELECT] [--columns F,...] [--json]  # table of matching tracks
-ipod-db-editor show  [SELECT]                          # every field of matching tracks, as JSON
-ipod-db-editor set   [SELECT] FIELD=VALUE... [WRITE]   # change fields on matching tracks
-ipod-db-editor apply EDITS.json [WRITE]                # different changes per track
-```
+| Command | What it does |
+| --- | --- |
+| `fields` | List every field and whether it is editable |
+| `list` | Table of matching tracks (`--columns a,b`, `--json`) |
+| `show` | Every field of matching tracks, as JSON |
+| `set FIELD=VALUE...` | Change fields on matching tracks |
+| `apply EDITS.json` | Apply different changes per track |
 
-Every command except `fields` takes `--input PATH`. It defaults to the connected iPod's `iPod_Control/iTunes/iTunesDB`. Run any command with `--help` for its options. Options go after the command name.
+All commands except `fields` read the connected iPod by default. Use `--input PATH` to work on a local copy instead. Run any command with `--help` for details.
 
-The rules are the same for every command:
+## Selecting tracks
 
-- **Selection** (`list`, `show`, `set`): `--id HEX`, `--filter EXPR` and `--match TEXT` all must match (AND). Repeated `--id` values combine with OR. `--match TEXT` is the same as `--filter 'title~TEXT'`. A missing ID gives a warning, not an error.
-- **Counts never fail a read.** `list` and `show` print all matching tracks, which can be none. Only `set` fails when nothing matches. `set` also needs at least one selector, so it never edits every track by accident.
-- **Writes are explicit.** `set` and `apply` show a preview unless you give `-o PATH` (write a new local file) or `--in-place` (back up, then replace `--input`).
-- **Only writes need the device GUID, and it is found automatically.** `set` and `apply` try the GUIDs in `Device/SysInfo` and `Device/SysInfoExtended` (next to `--input` or on the mounted iPod), every iPod in `~/Library/Preferences/com.apple.iPod.plist`, and the USB serial number of any connected iPod. They use the first one that matches the database's HASH58 signature. If none matches, give `--firewire-id HEX`; it is then used as given. `list` and `show` do not use it.
-
-## Find tracks
+- `--id HEX` - persistent track ID (shown by `list`). Repeat for several tracks.
+- `--match TEXT` - title contains TEXT.
+- `--filter EXPR` - any field from `fields`. Repeat to combine (all must match).
 
 ```sh
-ipod-db-editor list --input evidence/before-edits.iTunesDB --match Middlebrow
+ipod-db-editor list --filter 'artist~dire straits' --filter 'year>=1985'
 ```
 
-The ID shown is the track's persistent ID, preserved across the iOpenPod rewrites. Use it instead of a row number or the numeric track ID that iOpenPod reassigned.
+Operators: `=` `!=` (exact), `~` `!~` (contains), `>` `>=` `<` `<=` (numbers). Text matching ignores case. Quote filters so the shell does not eat `<`, `>` or `&`.
 
-By default `list` shows the media type and title. Use `--columns` to choose other fields, and `--json` for a JSON array:
+## Editing
 
 ```sh
-ipod-db-editor list --filter 'media_type&podcast' --columns album,podcast_group
+ipod-db-editor set 'title=Sultans of Swing' rating=80 --id A242151529FFD1D0
 ```
 
-## Show all fields
+- `rating` is 0-100 (80 = four stars). Booleans take `true`/`false`.
+- `media_type` takes names: `music`, `video`, `podcast`, `audiobook`, `music_video`, `tv_show`.
+  - `media_type=podcast` replaces the value.
+  - `media_type=+podcast,-music` adds/removes bits.
+  - `--filter 'media_type&podcast'` matches any track with the podcast bit.
+- `podcast_group='99% Invisible'` moves an episode under an existing podcast in the iPod's Podcasts menu. Useful for episodes that show up under "Root". Find them with `--filter 'media_type&podcast' --filter 'podcast_group='`.
 
-```sh
-ipod-db-editor show --input evidence/before-edits.iTunesDB --id A242151529FFD1D0
-```
-
-`show` prints a JSON array with one object per matching track. Each object contains every field from `fields`. Media type also shows as a hex value, decoded flag names and any unknown bits. Missing text fields show as empty strings, as they do in filters. This shows the editor's known fields, not undocumented binary fields.
-
-## Filter by fields
-
-Use repeatable `--filter` options for any field that `fields` lists:
-
-```sh
-ipod-db-editor list --filter 'artist~Justice' --filter 'year>=2007'
-```
-
-- Text: `=` and `!=` compare the entire value; `~` and `!~` test a substring. All text comparisons are case-insensitive. An absent text field is treated as empty, so `--filter 'comment='` matches absent or empty comments.
-- Numbers: `=`, `!=`, `>`, `>=`, `<`, `<=`. Decimal and `0x` values work; bool fields also accept `true` and `false`.
-- Media types: `--filter 'media_type=podcast'` matches exactly `0x04`; `--filter 'media_type&podcast'` matches any track with the podcast bit, including music+podcast and video+podcast. Comma-separated names work too; `&` requires all specified bits. Signed edit operations are not allowed in filters.
-- Quote expressions so the shell does not interpret `<`, `>` or `&`. Text after the operator is literal, including spaces and equals signs.
-
-Unknown fields or invalid operators fail with an error before the database is read.
-
-## Edit fields
-
-`set` applies the same assignments to every selected track. Run `list` with the same selectors first, and omit `-o`/`--in-place` to preview the change report:
-
-```sh
-ipod-db-editor set \
-  --input evidence/before-edits.iTunesDB \
-  --id A242151529FFD1D0 \
-  'title=Wanta Fanda' rating=80 remember_position=true \
-  -o candidates/renamed.iTunesDB
-```
-
-Put the `FIELD=VALUE` assignments together, before or after the options.
-
-Text edits preserve the existing text encoding and unknown record fields. Longer and shorter strings are supported, and enclosing sizes are updated. Missing text records are added using the standard UTF-16LE layout. Empty values set empty strings rather than deleting records. Existing opaque records, numeric IDs, album tables and playlists remain unchanged.
-
-`rating` uses 0-100; 80 represents four stars. Bool fields accept true/false or 1/0. Every assignment changes only the named field; duplicate/shadow fields are not automatically rewritten.
-
-`media_type` is a bitmask, so it supports exact assignment or changes to selected bits. Media type edits change the database field, not the encoded file format or podcast subscriptions:
-
-```sh
-media_type=podcast                 # Replace the mask with 0x04.
-media_type=music,podcast           # Replace the mask with 0x05.
-media_type=0x04                    # Numeric assignment.
-media_type=-music                  # Clear music; preserve every other bit.
-media_type=+podcast,-music         # Set podcast and clear music.
-```
-
-Names: music (1), video (2), podcast (4), audiobook (8), music_video (32), tv_show (64). Numeric masks can represent other bits. Within one assignment, use either absolute values or signed additions/removals. The same strings work in JSON.
-
-File locations, track IDs, encoded audio properties, artwork and unknown offsets are intentionally not editable.
-
-### Stale indexes
-
-Apple also stores sort indexes, album/artist grouping, artwork associations and smart-playlist state. This script preserves those records; it does not regenerate them. A title can keep its old sort position; album or artist changes can leave stale group associations; new lyrics do not automatically set the separate lyrics flag. Explicit sort-title overrides remain unchanged unless separately edited.
-
-`fields` marks the fields that feed these indexes with `*` (all text fields, `track_number`, `disc_number` and `media_type`). When an edit changes one of them, the report's `warnings` list names the fields. Finder acceptance, browsing consistency and persistence after the next Apple sync are not guaranteed. This is a surgical patch tool, not a complete general-purpose sync engine.
-
-## Podcast group links
-
-The iPod's Podcasts menu does not group episodes by album or artist. It reads the Podcasts playlist in the database, which holds one group-header entry per podcast and, for each episode entry, a reference to its header. An episode whose reference is 0 is shown under a fallback group named "Root", even when a header with the right name exists. Finder has been observed writing such unlinked entries.
-
-```sh
-ipod-db-editor list --filter 'media_type&podcast' --filter 'podcast_group='
-
-ipod-db-editor set \
-  --input evidence/unlinked-groups.iTunesDB \
-  --id 5F413F281B4090BF \
-  podcast_group=Middlebrow \
-  -o candidates/relinked.iTunesDB
-```
-
-`podcast_group` is the title of the episode's group header, or an empty string when the episode is unlinked or not in the Podcasts playlist. It appears in `show` and can be filtered like a text field. Setting it patches the four-byte reference in the episode's playlist entry so it points at the existing header with that title (case-insensitive). The header must already exist; this tool does not create group headers, and it does not add tracks to the playlist. Only the type-3 playlist dataset, which the iPod Classic reads, is patched.
-
-## Different changes per track
-
-For different changes on each track, save a JSON file:
+For different changes per track, use `apply` with a JSON file:
 
 ```json
 [
-  {
-    "id": "A14F1B1379489891",
-    "set": {"title": "Door to Door w/ Recho Omondi", "media_type": "podcast"}
-  },
-  {
-    "id": "A242151529FFD1D0",
-    "set": {"title": "Wanta Fanda", "media_type": "podcast"}
-  }
+  {"id": "A14F1B1379489891", "set": {"title": "Ten Thousand Years", "media_type": "podcast"}},
+  {"id": "A242151529FFD1D0", "set": {"title": "Vexillonaire"}}
 ]
 ```
 
-```sh
-ipod-db-editor apply edits.json \
-  --input evidence/before-edits.iTunesDB \
-  -o candidates/bulk-edited.iTunesDB
-```
+## Saving changes
 
-IDs that are not in the database are skipped with a warning and listed in the report's `skipped_ids`.
+`set` and `apply` only preview by default. To write, add one of:
 
-## Writing the result
+- `--in-place` - back up, then replace the database on the iPod.
+- `-o PATH` - write to a new local file.
 
-`set` and `apply` print a JSON change report with source/result SHA256 hashes. Redirect stdout to a separate report file if desired. Without an output option, nothing is written.
+## Caveats
 
-- `-o PATH` writes a new local file. It refuses to overwrite an existing file or to write under `/Volumes`.
-- `--in-place` copies the current database to `~/Library/Application Support/ipod-db-editor/backups/iTunesDB.backup-YYYYMMDD-HHMMSS` on the Mac (never on the iPod), then replaces `--input` with the edited database. The report includes the backup path.
+- The iPod keeps its own sort and grouping indexes, which this tool does not rebuild. After changing titles, artists, albums etc., items may sort or group under old values. The tool warns when this can happen.
+- Your next Finder sync may overwrite edits with your Mac library's metadata.
+- Make sure Finder is not syncing while you edit in place.
 
-Both fail if there are no changes, and you can use only one of them:
+## Development
 
 ```sh
-ipod-db-editor set --filter 'media_type=5' media_type=podcast --in-place
-```
-
-## Installing and testing
-
-Without `--in-place`, the script creates local candidates only. Installing one manually means replacing `iPod_Control/iTunes/iTunesDB` on the mounted device, which is a separate operation. First preserve the current database and matching preferences outside the iPod, and make sure neither Finder nor iOpenPod is syncing. Eject and reconnect after installation to test Finder acceptance.
-
-For the existing warning, the useful controlled sequence is: confirm Finder accepts the untouched pre-edit baseline with its matching saved preferences; then test the podcast-only candidate; then try broader metadata edits one at a time. Do not substitute a factory restore for these tests. Start future edits from a Finder-accepted database. Apple syncing can overwrite device-side metadata using the Mac library, so make the corresponding source-library change where possible if it must persist.
-
-## Validation
-
-After `pip install -e .`, run `python3 -m unittest discover -v -s tests` from the repository root. The 26 tests use the saved evidence and local temporary files, without writing to the iPod. They cover exact no-op round trips and signatures for all four copies, four-byte-only podcast changes, Unicode string growth/shrink, preservation of unrelated records, adding missing text, scalar edits, podcast group links, malformed data, incorrect GUIDs, automatic GUID lookup, filters and selection, list columns, stale-index warnings, exclusive output, in-place replacement with backups and JSON batches.
-
-HASH58 is implemented with the libgpod-documented key derivation. HASH72 retains the original signature's IV/random bytes and recomputes its digest/encryption using OpenSSL; it does not create a new device identity. The tests confirm that signing an unmodified source produces its exact original bytes. Apple's private database validation has not been reproduced.
-
-## Code layout
-
-```
-src/ipod_db_editor/
-  cli.py        argparse commands, change reports and the console entry point
-  itunesdb.py   byte-exact chunk tree parse/render and text records
-  podcasts.py   Podcasts-menu group links in the type-3 playlist dataset
-  tracks.py     read, filter and edit one track's fields
-  fields.py     field tables, media type flags and value parsing
-  signing.py    HASH58 and HASH72 signatures
-  device.py     default database path and FireWire GUID discovery
-  files.py      exclusive writes, backups and in-place replacement
+pip install -e .
+python3 -m unittest discover -v -s tests
 ```
