@@ -1,3 +1,5 @@
 evidence
 candidates
 backups
+.DS_Store
+*.pyc
