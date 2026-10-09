@@ -42,7 +42,7 @@ def render(field, value, style=''):
     if field == 'rating':
         return stars(value, style)
     if is_bool(field):
-        return Text('✓', style + ' green') if value else Text('·', style + ' dim')
+        return Text('✓', style + ' green') if value else Text('|', style + ' dim')
     if value == '':
         return Text('—', 'dim')
     return Text(str(value), style)
@@ -50,12 +50,13 @@ def render(field, value, style=''):
 
 def media_names(mask, style=''):
     text = Text(style=style)
+    text.append('0x%02X ' % mask, 'dim')
     parts = [(name, MEDIA_STYLES[name]) for name, bits in MEDIA_TYPES.items() if mask & bits == bits]
     if mask & ~KNOWN_MEDIA_BITS:
         parts.append(('0x%X' % (mask & ~KNOWN_MEDIA_BITS), 'red'))
     for i, (name, color) in enumerate(parts or [('none', 'dim')]):
         if i:
-            text.append(' · ', 'dim')
+            text.append(' | ', 'dim')
         text.append(name, color)
     return text
 
@@ -166,10 +167,7 @@ def print_details(tracks):
         grid.add_column(style='dim', justify='right', no_wrap=True)
         grid.add_column(overflow='fold')
         for field in FIELDS:
-            value = render(field, info[field])
-            if field == 'media_type':
-                value = Text.assemble((info['media_type_hex'], 'dim'), '  ', value)
-            grid.add_row(field, value)
+            grid.add_row(field, render(field, info[field]))
         title = Text(info['title'] or 'Untitled', 'bold')
         console.print(Panel(grid, title=title, title_align='left', border_style='grey42', expand=False))
 
