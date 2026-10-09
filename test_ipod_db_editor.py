@@ -42,7 +42,7 @@ class MetadataTests(unittest.TestCase):
                     if edit.u32(track.header, 0xD0) == 5:
                         positions.append(cursor + 0xD0)
                         expected[cursor + 0xD0] = 4
-                        edit.edit_track(track, {'media_type': '-music'}, True)
+                        edit.edit_track(track, {'media_type': '-music'})
                     cursor += len(track.raw)
             offset += len(dataset.raw)
         self.assertEqual(len(positions), 4)
@@ -61,7 +61,7 @@ class MetadataTests(unittest.TestCase):
         original_tracks = [c.render() for c in self.tracks[:-1]]
         opaque = [c.render() for c in self.root.children if c.children is None]
         for value in ['A much longer title ' * 30 + '\U0001f3b5 caf\u00e9', 'X', '']:
-            edit.edit_track(target, {'title': value}, True)
+            edit.edit_track(target, {'title': value})
             result = edit.sign(self.root.render(), GUID, self.signature)
             root, tracks = edit.parse(result)
             self.assertEqual(edit.get_text(tracks[-1], 1)[0], value)
@@ -76,7 +76,7 @@ class MetadataTests(unittest.TestCase):
         target = next(t for t in self.tracks if edit.get_text(t, 8)[1] is None)
         pid = edit.persistent_id(target)
         before = [c.render() for c in target.children]
-        edit.edit_track(target, {'comment': 'new note'}, True)
+        edit.edit_track(target, {'comment': 'new note'})
         _, tracks = edit.parse(edit.sign(self.root.render(), GUID, self.signature))
         changed = next(t for t in tracks if edit.persistent_id(t) == pid)
         self.assertEqual(edit.get_text(changed, 8)[0], 'new note')
@@ -101,11 +101,10 @@ class MetadataTests(unittest.TestCase):
             edit.parse(self.data[:-1])
 
     def test_input_validation(self):
-        for fields, experimental in [({'title': 'X'}, False), ({'rating': 101}, False),
-                                      ({'track_id': 2}, True), ({'title': 'bad\0text'}, True),
-                                      ({'year': 1.5}, False), ({'podcast_only': True}, False)]:
+        for fields in [{'rating': 101}, {'track_id': 2}, {'title': 'bad\0text'},
+                       {'year': 1.5}, {'podcast_only': True}]:
             with self.assertRaises(ValueError):
-                edit.edit_track(self.tracks[0], fields, experimental)
+                edit.edit_track(self.tracks[0], fields)
 
     def test_media_type_names_numbers_and_relative_bits(self):
         for value in ['podcast', '4', '0x04', 4]:
@@ -119,16 +118,14 @@ class MetadataTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 edit.media_type(value, 5)
         track = self.tracks[0]
-        with self.assertRaises(ValueError):
-            edit.edit_track(track, {'media_type': 'podcast'}, False)
-        result = edit.edit_track(track, {'media_type': 'video,podcast'}, True)
+        result = edit.edit_track(track, {'media_type': 'video,podcast'})
         self.assertEqual(edit.u32(track.header, 0xD0), 6)
         self.assertEqual(result[0]['field'], 'media_type')
 
     def test_numeric_patch_is_exact(self):
         target = self.tracks[0]
         before = bytearray(target.render())
-        edit.edit_track(target, {'rating': 80, 'remember_position': True}, False)
+        edit.edit_track(target, {'rating': 80, 'remember_position': True})
         before[0x1F] = 80
         before[0xA6] = 1
         self.assertEqual(target.render(), bytes(before))
@@ -144,45 +141,87 @@ class MetadataTests(unittest.TestCase):
             edit.write_exclusive(Path('/Volumes/iPod/test'), b'one')
 
     def run_cli(self, args):
-        stream = io.StringIO()
-        with patch.object(sys, 'argv', ['ipod_db_editor.py'] + args), contextlib.redirect_stdout(stream):
-            edit.main()
+        # Keep stderr in self.errors so warnings can be checked and argparse usage stays quiet.
+        stream, errors = io.StringIO(), io.StringIO()
+        try:
+            with patch.object(sys, 'argv', ['ipod_db_editor.py'] + args), \
+                    contextlib.redirect_stdout(stream), contextlib.redirect_stderr(errors):
+                edit.main()
+        finally:
+            self.errors = errors.getvalue()
         return stream.getvalue()
 
     def test_preview_does_not_change_input(self):
-        output = self.run_cli(['edit', '--input', str(BASE), '--firewire-id', GUID.hex(),
-                               '--podcasts', '--set', 'media_type=podcast', '--experimental'])
+        output = self.run_cli(['set', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                               '--filter', 'media_type&podcast', 'media_type=podcast'])
         report = json.loads(output)
         self.assertEqual(len(report['changes']), 4)
         self.assertNotIn('output', report)
         self.assertEqual(BASE.read_bytes(), self.data)
 
-    def test_ambiguous_title_match_rejected(self):
-        with self.assertRaises(ValueError):
-            self.run_cli(['edit', '--input', str(BASE), '--firewire-id', GUID.hex(),
-                          '--match', '', '--set', 'rating=80'])
+    def test_set_requires_selection_assignments_and_one_output(self):
+        cli = ['set', '--input', str(BASE), '--firewire-id', GUID.hex()]
+        for args, error in [(['rating=80'], ValueError),
+                            (['--match', 'x', 'track_id=4'], ValueError),
+                            (['--match', 'x', 'rating'], ValueError),
+                            (['--match', 'x', 'rating=1', 'rating=2'], ValueError),
+                            (['--match', 'x'], SystemExit),
+                            (['--match', 'x', 'rating=1', '-o', 'a', '--in-place'], SystemExit)]:
+            with self.assertRaises(error, msg=str(args)):
+                self.run_cli(cli + args)
+        self.assertEqual(BASE.read_bytes(), self.data)
+
+    def test_title_match_edits_every_matching_track(self):
+        # --match has no ambiguity guard; it works like any other filter.
+        wanted = {edit.persistent_id(t) for t in self.tracks
+                  if 'the' in edit.get_text(t, 1)[0].casefold() and t.header[0x1F] != 80}
+        self.assertGreater(len(wanted), 1)
+        report = json.loads(self.run_cli(['set', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                                          '--match', 'THE', 'rating=80']))
+        self.assertEqual({c['id'] for c in report['changes']}, wanted)
+
+    def test_report_warns_only_for_indexed_fields(self):
+        cli = ['set', '--input', str(BASE), '--firewire-id', GUID.hex(), '--id', edit.persistent_id(self.tracks[0])]
+        report = json.loads(self.run_cli(cli + ['rating=80']))
+        self.assertEqual(report['warnings'], [])
+        report = json.loads(self.run_cli(cli + ['title=New', 'rating=80']))
+        self.assertEqual(len(report['warnings']), 1)
+        self.assertIn('title', report['warnings'][0])
 
     def test_list_filters_combine_text_numbers_and_flags(self):
         track = next(t for t in self.tracks if edit.u32(t.header, 0xD0) == 5)
         pid = edit.persistent_id(track)
-        output = self.run_cli(['list', '--input', str(BASE), '--firewire-id', GUID.hex(),
+        output = self.run_cli(['list', '--input', str(BASE),
                                '--filter', 'title~' + edit.get_text(track, 1)[0].swapcase(),
                                '--filter', 'media_type&podcast', '--filter', 'year>=0',
                                '--filter', 'persistent_id=' + pid.lower()])
         self.assertEqual(len(output.splitlines()), 2)
         self.assertIn(pid, output)
-        exact = self.run_cli(['list', '--input', str(BASE), '--firewire-id', GUID.hex(),
-                              '--filter', 'media_type=podcast'])
+        self.assertIn('0x05', output)
+        exact = self.run_cli(['list', '--input', str(BASE), '--filter', 'media_type=podcast'])
         self.assertEqual(len(exact.splitlines()), 1)
-        includes = self.run_cli(['list', '--input', str(BASE), '--firewire-id', GUID.hex(),
-                                 '--filter', 'media_type&podcast'])
+        includes = self.run_cli(['list', '--input', str(BASE), '--filter', 'media_type&podcast'])
         self.assertEqual(len(includes.splitlines()), 5)
         self.assertEqual(BASE.read_bytes(), self.data)
 
+    def test_list_columns_and_json(self):
+        track = self.tracks[0]
+        pid = edit.persistent_id(track)
+        cli = ['list', '--input', str(BASE), '--id', pid, '--columns', 'artist,year,persistent_id']
+        lines = self.run_cli(cli).splitlines()
+        self.assertEqual(lines[0].split(), ['PERSISTENT', 'ID', 'ARTIST', 'YEAR'])
+        self.assertTrue(lines[1].startswith(pid))
+        self.assertTrue(lines[1].endswith(str(edit.attribute(track, 'year'))))
+        rows = json.loads(self.run_cli(cli + ['--json']))
+        self.assertEqual(rows, [{'persistent_id': pid, 'artist': edit.get_text(track, 4)[0],
+                                 'year': edit.attribute(track, 'year')}])
+        with self.assertRaises(SystemExit):
+            self.run_cli(['list', '--input', str(BASE), '--columns', 'nope'])
+
     def test_filter_operator_semantics(self):
         track = self.tracks[0]
-        edit.edit_track(track, {'title': 'Caf\u00e9=Live', 'rating': 80, 'remember_position': True}, True)
-        for expression in ['title=CAF\u00c9=LIVE', 'title~f\u00e9=', 'title!=Other', 'title!~Other',
+        edit.edit_track(track, {'title': 'Café=Live', 'rating': 80, 'remember_position': True})
+        for expression in ['title=CAFÉ=LIVE', 'title~fé=', 'title!=Other', 'title!~Other',
                            'rating>79', 'rating>=80', 'rating<81', 'rating<=80', 'rating!=0',
                            'rating=0x50', 'remember_position=true', 'track_id=' + str(edit.u32(track.header, 16)),
                            'location=' + edit.get_text(track, 2)[0]]:
@@ -201,32 +240,30 @@ class MetadataTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_cli(['list', '--input', '/nonexistent', '--filter', 'unknown=x'])
 
-    def test_edit_selects_tracks_by_filter(self):
-        cli = ['edit', '--input', str(BASE), '--firewire-id', GUID.hex()]
+    def test_set_selects_tracks_by_filter(self):
+        cli = ['set', '--input', str(BASE), '--firewire-id', GUID.hex()]
         wanted = {edit.persistent_id(t) for t in self.tracks if edit.u32(t.header, 0xD0) == 5}
         self.assertGreater(len(wanted), 1)
         with tempfile.TemporaryDirectory() as folder:
             out = Path(folder) / 'candidate'
-            report = json.loads(self.run_cli([*cli, '--filter', 'media_type=5', '--set', 'media_type=4',
-                                             '--experimental', '--output', str(out)]))
+            report = json.loads(self.run_cli([*cli, '--filter', 'media_type=5', 'media_type=4', '-o', str(out)]))
             self.assertEqual({c['id'] for c in report['changes']}, wanted)
             _, tracks = edit.parse(out.read_bytes())
             for track in tracks:
                 if edit.persistent_id(track) in wanted:
                     self.assertEqual(edit.u32(track.header, 0xD0), 4)
         with self.assertRaises(ValueError):
-            self.run_cli([*cli, '--filter', 'media_type=5'])
-        with self.assertRaises(ValueError):
-            self.run_cli([*cli, '--filter', 'title=no such title', '--set', 'rating=80'])
-        with self.assertRaises(ValueError):
-            self.run_cli([*cli, '--filter', 'media_type=5', '--edits', 'edits.json'])
+            self.run_cli([*cli, '--filter', 'title=no such title', 'rating=80'])
+        with self.assertRaises(SystemExit):
+            self.run_cli(['apply', '--input', str(BASE), '--filter', 'media_type=5', 'edits.json'])
         self.assertEqual(BASE.read_bytes(), self.data)
 
-    def test_view_track_fields_and_combined_media_flags(self):
+    def test_show_track_fields_and_combined_media_flags(self):
         track = next(t for t in self.tracks if edit.u32(t.header, 0xD0) == 5)
         pid = edit.persistent_id(track)
-        details = json.loads(self.run_cli(['view', '--input', str(BASE), '--firewire-id', GUID.hex(),
-                                          '--id', pid]))
+        shown = json.loads(self.run_cli(['show', '--input', str(BASE), '--id', pid]))
+        self.assertEqual(len(shown), 1)
+        details = shown[0]
         self.assertEqual(details['persistent_id'], pid)
         self.assertEqual(details['title'], edit.get_text(track, 1)[0])
         self.assertEqual(details['track_id'], edit.u32(track.header, 16))
@@ -234,47 +271,54 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(details['media_type'], 5)
         self.assertEqual(details['media_type_flags'], ['music', 'podcast'])
         self.assertEqual(details['media_type_unknown_bits'], '0x00000000')
-        self.assertTrue(set(edit.TEXT) | set(edit.NUMBER) <= details.keys())
+        self.assertEqual(set(details), set(edit.FIELDS) | {'media_type_hex', 'media_type_flags',
+                                                           'media_type_unknown_bits'})
         self.assertEqual(BASE.read_bytes(), self.data)
-        filtered = json.loads(self.run_cli(['view', '--input', str(BASE), '--firewire-id', GUID.hex(),
-                                           '--match', details['title'], '--filter', 'media_type&podcast',
-                                           '--filter', 'persistent_id=' + pid]))
-        self.assertEqual(filtered, details)
+        filtered = json.loads(self.run_cli(['show', '--input', str(BASE), '--match', details['title'],
+                                            '--filter', 'media_type&podcast', '--filter', 'persistent_id=' + pid]))
+        self.assertEqual(filtered, [details])
 
-    def test_view_rejects_ambiguous_missing_and_write_options(self):
-        for selection in [[], ['--match', ''], ['--match', 'NO SUCH TRACK 999999'],
-                          ['--id', 'FFFFFFFFFFFFFFFF'], ['--match', '', '--all-matches'],
-                          ['--match', '', '--set', 'rating=80'],
-                          ['--match', '', '--output', '/tmp/unused-candidate'],
-                          ['--match', '', '--upload'],
-                          ['--match', '', '--edits', '/tmp/unused-edits']]:
-            with self.assertRaises(ValueError, msg=str(selection)):
-                self.run_cli(['view', '--input', str(BASE), '--firewire-id', GUID.hex()] + selection)
+    def test_show_prints_every_match_and_rejects_write_options(self):
+        cli = ['show', '--input', str(BASE)]
+        self.assertEqual(len(json.loads(self.run_cli(cli))), len(self.tracks))
+        self.assertEqual(len(json.loads(self.run_cli(cli + ['--match', '']))), len(self.tracks))
+        self.assertEqual(json.loads(self.run_cli(cli + ['--match', 'NO SUCH TRACK 999999'])), [])
+        self.assertEqual(json.loads(self.run_cli(cli + ['--id', 'FFFFFFFFFFFFFFFF'])), [])
+        self.assertIn('FFFFFFFFFFFFFFFF', self.errors)
+        for extra in [['rating=80'], ['-o', '/tmp/unused-candidate'], ['--in-place'],
+                      ['--firewire-id', GUID.hex()], ['--id', 'not-hex']]:
+            with self.assertRaises(SystemExit, msg=str(extra)):
+                self.run_cli(cli + ['--match', ''] + extra)
         self.assertEqual(BASE.read_bytes(), self.data)
 
-    def test_json_batch_and_real_output(self):
+    def test_apply_json_batch_and_real_output(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'edits.json'
             out = Path(folder) / 'candidate'
             path.write_text(json.dumps([{'id': edit.persistent_id(self.tracks[0]), 'set': {'rating': 80}}]))
-            report = json.loads(self.run_cli(['edit', '--input', str(BASE), '--firewire-id', GUID.hex(),
-                                             '--edits', str(path), '--output', str(out)]))
+            report = json.loads(self.run_cli(['apply', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                                              str(path), '-o', str(out)]))
             self.assertEqual(len(report['changes']), 1)
             _, tracks = edit.parse(out.read_bytes())
             self.assertEqual(tracks[0].header[0x1F], 80)
+            for jobs in [[], {}, [{'id': 'zz', 'set': {'rating': 1}}], [{'id': 'AB', 'set': {}}],
+                         [{'id': 'AB', 'set': {'rating': 1}}, {'id': '0xab', 'set': {'rating': 2}}]]:
+                path.write_text(json.dumps(jobs))
+                with self.assertRaises(ValueError, msg=str(jobs)):
+                    self.run_cli(['apply', '--input', str(BASE), '--firewire-id', GUID.hex(), str(path)])
             self.assertEqual(BASE.read_bytes(), self.data)
 
-    def test_upload_backs_up_and_replaces_input(self):
+    def test_in_place_backs_up_and_replaces_input(self):
         with tempfile.TemporaryDirectory() as folder:
             target = Path(folder) / 'iTunesDB'
             target.write_bytes(self.data)
-            args = ['edit', '--input', str(target), '--firewire-id', GUID.hex(),
-                    '--id', edit.persistent_id(self.tracks[0]), '--set', 'rating=80']
+            args = ['set', '--input', str(target), '--firewire-id', GUID.hex(),
+                    '--id', edit.persistent_id(self.tracks[0]), 'rating=80']
             with self.assertRaises(ValueError):
-                self.run_cli(args + ['--upload', '--output', str(Path(folder) / 'other')])
+                self.run_cli(args + ['-o', str(target)])
             backups = Path(folder) / 'backups'
             with patch.object(edit, 'BACKUPS', backups):
-                report = json.loads(self.run_cli(args + ['--upload']))
+                report = json.loads(self.run_cli(args + ['--in-place']))
             backup = Path(report['backup'])
             self.assertEqual(backup.parent, backups.resolve())
             self.assertTrue(backup.name.startswith('iTunesDB.backup-'))
@@ -284,31 +328,32 @@ class MetadataTests(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in Path(folder).iterdir()), ['backups', 'iTunesDB'])
             self.assertEqual([p.name for p in backups.iterdir()], [backup.name])
             with self.assertRaises(ValueError):
-                self.run_cli(args + ['--upload'])
+                self.run_cli(args + ['--in-place'])
 
-    def test_edit_warns_and_skips_missing_ids(self):
-        errors = io.StringIO()
+    def test_missing_ids_warn_and_skip(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'edits.json'
             path.write_text(json.dumps([{'id': 'FFFFFFFFFFFFFFFF', 'set': {'rating': 80}},
                                         {'id': edit.persistent_id(self.tracks[0]), 'set': {'rating': 80}}]))
-            with contextlib.redirect_stderr(errors):
-                report = json.loads(self.run_cli(['edit', '--input', str(BASE), '--firewire-id', GUID.hex(),
-                                                 '--edits', str(path)]))
+            report = json.loads(self.run_cli(['apply', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                                              str(path)]))
         self.assertEqual(len(report['changes']), 1)
         self.assertEqual(report['skipped_ids'], ['FFFFFFFFFFFFFFFF'])
-        self.assertIn('Warning: persistent ID not found, skipped: FFFFFFFFFFFFFFFF', errors.getvalue())
-        with contextlib.redirect_stderr(errors):
-            report = json.loads(self.run_cli(['edit', '--input', str(BASE), '--firewire-id', GUID.hex(),
-                                             '--id', 'FFFFFFFFFFFFFFFF', '--id', edit.persistent_id(self.tracks[0]),
-                                             '--set', 'rating=80']))
+        self.assertIn('Warning: persistent ID not found, skipped: FFFFFFFFFFFFFFFF', self.errors)
+        report = json.loads(self.run_cli(['set', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                                          '--id', 'FFFFFFFFFFFFFFFF', '--id', edit.persistent_id(self.tracks[0]),
+                                          'rating=80']))
         self.assertEqual(len(report['changes']), 1)
         self.assertEqual(report['skipped_ids'], ['FFFFFFFFFFFFFFFF'])
+        output = self.run_cli(['list', '--input', str(BASE), '--id', 'FFFFFFFFFFFFFFFF'])
+        self.assertEqual(len(output.splitlines()), 1)
+        self.assertIn('FFFFFFFFFFFFFFFF', self.errors)
         with self.assertRaises(ValueError):
-            self.run_cli(['list', '--input', str(BASE), '--firewire-id', GUID.hex(), '--id', 'FFFFFFFFFFFFFFFF'])
+            self.run_cli(['set', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                          '--id', 'FFFFFFFFFFFFFFFF', 'rating=80'])
         self.assertEqual(BASE.read_bytes(), self.data)
 
-    def test_podcast_group_view_filter_and_link(self):
+    def test_podcast_group_show_filter_and_link(self):
         data = UNLINKED.read_bytes()
         root, tracks = edit.parse(data)
         playlist = edit.PodcastPlaylist.load(root)
@@ -318,27 +363,25 @@ class MetadataTests(unittest.TestCase):
         pid = edit.persistent_id(orphan)
         self.assertEqual(playlist.group_of(by_title['Vanguard']), 'Acquired')
         self.assertEqual(playlist.group_of(orphan), '')
-        cli = ['--input', str(UNLINKED), '--firewire-id', GUID.hex()]
-        unlinked = self.run_cli(['list', *cli, '--podcasts', '--filter', 'podcast_group='])
+        cli = ['--input', str(UNLINKED)]
+        unlinked = self.run_cli(['list', *cli, '--filter', 'media_type&podcast', '--filter', 'podcast_group='])
         self.assertEqual(len(unlinked.splitlines()), 3)
         self.assertIn(pid, unlinked)
         self.assertEqual(len(self.run_cli(['list', *cli, '--filter', 'podcast_group=acquired']).splitlines()), 3)
-        self.assertEqual(json.loads(self.run_cli(['view', *cli, '--id', pid]))['podcast_group'], '')
+        self.assertEqual(json.loads(self.run_cli(['show', *cli, '--id', pid]))[0]['podcast_group'], '')
         with self.assertRaises(ValueError):
-            edit.edit_track(orphan, {'podcast_group': 'Middlebrow'}, False, playlist)
-        with self.assertRaises(ValueError):
-            edit.edit_track(orphan, {'podcast_group': 'Middlebrow'}, True, None)
+            edit.edit_track(orphan, {'podcast_group': 'Middlebrow'}, None)
         for value in ['Nope', 1]:
             with self.assertRaises(ValueError):
-                edit.edit_track(orphan, {'podcast_group': value}, True, playlist)
+                edit.edit_track(orphan, {'podcast_group': value}, playlist)
         music = next(t for t in tracks if edit.u32(t.header, 0xD0) == 1)
         with self.assertRaises(ValueError):
-            edit.edit_track(music, {'podcast_group': 'Middlebrow'}, True, playlist)
+            edit.edit_track(music, {'podcast_group': 'Middlebrow'}, playlist)
         # The playlist dataset bytes are unchanged after the rejected edits.
         self.assertEqual(root.render(), data)
-        report = edit.edit_track(orphan, {'podcast_group': 'middlebrow'}, True, playlist)
+        report = edit.edit_track(orphan, {'podcast_group': 'middlebrow'}, playlist)
         self.assertEqual(report, [{'field': 'podcast_group', 'before': '', 'after': 'Middlebrow'}])
-        self.assertEqual(edit.edit_track(orphan, {'podcast_group': 'Middlebrow'}, True, playlist), [])
+        self.assertEqual(edit.edit_track(orphan, {'podcast_group': 'Middlebrow'}, playlist), [])
         result = edit.sign(root.render(), GUID, edit.validate_signature(data, GUID))
         self.assertEqual(len(result), len(data))
         index = root.children.index(playlist.dataset)
@@ -353,14 +396,15 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(edit.PodcastPlaylist.load(root).group_of(relinked), 'Middlebrow')
         with tempfile.TemporaryDirectory() as folder:
             out = Path(folder) / 'candidate'
-            report = json.loads(self.run_cli(['edit', *cli, '--id', pid, '--set', 'podcast_group=Middlebrow',
-                                             '--experimental', '--output', str(out)]))
+            report = json.loads(self.run_cli(['set', *cli, '--firewire-id', GUID.hex(), '--id', pid,
+                                              'podcast_group=Middlebrow', '-o', str(out)]))
             self.assertEqual(report['changes'][0]['changes'][0]['after'], 'Middlebrow')
+            self.assertEqual(report['warnings'], [])
             self.assertEqual(out.read_bytes(), result)
-            details = json.loads(self.run_cli(['view', '--input', str(out), '--firewire-id', GUID.hex(), '--id', pid]))
+            details = json.loads(self.run_cli(['show', '--input', str(out), '--id', pid]))[0]
             self.assertEqual(details['podcast_group'], 'Middlebrow')
         with self.assertRaises(ValueError):
-            self.run_cli(['edit', *cli, '--id', pid, '--set', 'podcast_group=Middlebrow'])
+            self.run_cli(['set', *cli, '--firewire-id', GUID.hex(), '--id', pid, 'podcast_group=Nope'])
         self.assertEqual(UNLINKED.read_bytes(), data)
 
 

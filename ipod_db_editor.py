@@ -37,10 +37,16 @@ MEDIA_TYPES = {
     'music': 0x01, 'video': 0x02, 'podcast': 0x04, 'audiobook': 0x08,
     'music_video': 0x20, 'tv_show': 0x40,
 }
-# These edits can affect indexes, grouping, or other records kept by Apple.
-EXPERIMENTAL = set(TEXT) | {'track_number', 'disc_number', 'media_type', 'podcast_group'}
+# Apple derives sort, group and smart-playlist indexes from these fields. Edits keep
+# those indexes unchanged, so the iPod can show stale order or grouping.
+INDEXED = set(TEXT) | {'track_number', 'disc_number', 'media_type'}
+# All fields that list, show and --filter accept. Only EDITABLE fields accept set.
+READ_ONLY = ['persistent_id', 'track_id', 'location']
+EDITABLE = ['podcast_group', *TEXT, *NUMBER]
+FIELDS = READ_ONLY + EDITABLE
 AES_KEY = '618ca10dc7f57fd3b4723e08157463d7'
 BACKUPS = Path(__file__).resolve().parent / 'backups'
+DEFAULT_INPUT = Path('/Volumes/iPod/iPod_Control/iTunes/iTunesDB')
 
 
 def u32(data, offset):
@@ -354,7 +360,7 @@ def sign(data, guid, signature_info):
 
 def device_guid(value, source):
     if value is None:
-        candidates = [source.parent.parent / 'Device' / 'SysInfo', Path('/Volumes/iPod/iPod_Control/Device/SysInfo')]
+        candidates = [source.parent.parent / 'Device' / 'SysInfo', DEFAULT_INPUT.parent.parent / 'Device' / 'SysInfo']
         for path in candidates:
             if path.is_file():
                 match = re.search(r'FirewireGuid\s*:\s*(?:0x)?([0-9a-fA-F]{16})', path.read_text())
@@ -414,6 +420,21 @@ def media_type(value, current):
     return result
 
 
+def is_text(field):
+    return field in TEXT or field in ('persistent_id', 'location', 'podcast_group')
+
+
+def describe(field):
+    if is_text(field):
+        return 'text'
+    if field == 'media_type':
+        return 'flags'
+    if field == 'track_id':
+        return 'number'
+    minimum, maximum = NUMBER[field][2:]
+    return 'bool' if maximum == 1 else 'number %d-%d' % (minimum, maximum)
+
+
 def attribute(track, field, playlist=None):
     if field in TEXT or field == 'location':
         return get_text(track, TEXT[field] if field in TEXT else 2)[0]
@@ -425,15 +446,23 @@ def attribute(track, field, playlist=None):
     return struct.unpack_from('<' + fmt, track.header, offset)[0]
 
 
+def details(track, playlist=None):
+    result = {field: attribute(track, field, playlist) for field in FIELDS}
+    mask = result['media_type']
+    result['media_type_hex'] = '0x%08X' % mask
+    result['media_type_flags'] = [name for name, bits in MEDIA_TYPES.items() if mask & bits == bits]
+    result['media_type_unknown_bits'] = '0x%08X' % (mask & ~sum(MEDIA_TYPES.values()))
+    return result
+
+
 def parse_filter(expression):
     match = re.fullmatch(r'([a-z_][a-z_0-9]*)\s*(!~|!=|>=|<=|=|~|>|<|&)(.*)', expression, re.DOTALL)
     if not match:
         raise ValueError('Use --filter FIELD=VALUE (or !=, ~, !~, >, >=, <, <=, &)')
     field, op, value = match.groups()
-    if field not in set(TEXT) | set(NUMBER) | {'location', 'track_id', 'persistent_id', 'podcast_group'}:
-        raise ValueError('Unknown filter attribute: ' + field)
-    text = field in TEXT or field in {'location', 'persistent_id', 'podcast_group'}
-    if text:
+    if field not in FIELDS:
+        raise ValueError('Unknown filter field: ' + field)
+    if is_text(field):
         if op not in {'=', '!=', '~', '!~'}:
             raise ValueError('Text filters support =, !=, ~ and !~')
         value = value.casefold()
@@ -473,13 +502,11 @@ def matches_filter(track, condition, playlist=None):
     return (actual & wanted) == wanted
 
 
-def edit_track(track, changes, experimental, playlist=None):
+def edit_track(track, changes, playlist=None):
     report = []
     for field, value in changes.items():
-        if field not in TEXT and field not in NUMBER and field != 'podcast_group':
-            raise ValueError('Unknown or unsupported field: ' + field)
-        if field in EXPERIMENTAL and not experimental:
-            raise ValueError('%s requires --experimental: derived Apple indexes are preserved, not rebuilt' % field)
+        if field not in EDITABLE:
+            raise ValueError('Unknown or read-only field: ' + field)
         if field == 'podcast_group':
             if not isinstance(value, str):
                 raise ValueError('podcast_group must be the title of an existing group header')
@@ -517,7 +544,7 @@ def write_new(path, data):
         os.fsync(file.fileno())
 
 
-def upload(path, original, result):
+def replace_in_place(path, original, result):
     # Keep a dated copy of the original on the Mac, then swap in the result atomically.
     backup = BACKUPS / (path.name + '.backup-' + datetime.now().strftime('%Y%m%d-%H%M%S'))
     write_exclusive(backup, original)
@@ -529,140 +556,213 @@ def upload(path, original, result):
     return backup
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['list', 'view', 'edit', 'fields'])
-    parser.add_argument('--input', type=Path, default=Path('/Volumes/iPod/iPod_Control/iTunes/iTunesDB'))
-    parser.add_argument('--output', type=Path, help='Write a NEW local file; omit for preview')
-    parser.add_argument('--upload', action='store_true',
-                        help='Back up --input to backups/ with a datestamp, then replace it with the edited database')
-    parser.add_argument('--firewire-id')
-    parser.add_argument('--id', action='append', default=[], help='Persistent hex ID shown by list; repeatable')
-    parser.add_argument('--match', help='Case-insensitive title substring')
-    parser.add_argument('--filter', action='append', default=[], metavar='FIELD=VALUE',
-                        help='Attribute comparison; repeat to require all filters')
-    parser.add_argument('--podcasts', action='store_true', help='Select all existing audio podcasts')
-    parser.add_argument('--all-matches', action='store_true', help='Allow --match to select more than one track')
-    parser.add_argument('--set', action='append', default=[], metavar='FIELD=VALUE')
-    parser.add_argument('--edits', type=Path, help='JSON array of {id, set} objects; cannot combine with selectors')
-    parser.add_argument('--experimental', action='store_true', help='Allow edits that may leave derived indexes stale')
-    args = parser.parse_args()
-    if args.action == 'view':
-        if args.set or args.edits or args.output or args.upload:
-            raise ValueError('view is read-only; --set, --edits, --output and --upload are not supported')
-        if not (args.id or args.match is not None or args.filter or args.podcasts):
-            raise ValueError('Select one track with --id, --match or --filter')
-    filters = [parse_filter(value) for value in args.filter]
-    if args.action == 'fields':
-        print('Numeric: ' + ', '.join(NUMBER))
-        print('Media types: ' + ', '.join(MEDIA_TYPES))
-        print('media_type accepts a number, comma-separated names, or signed flags: -music,+podcast')
-        print('Text: ' + ', '.join(TEXT))
-        print('Additional filter/view attributes: track_id, persistent_id, location, podcast_group')
-        print('podcast_group links a synced episode to an existing Podcasts-menu group header by title')
-        print('Experimental: ' + ', '.join(sorted(EXPERIMENTAL)))
+def hex_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r'(0x)?[0-9a-fA-F]{1,16}', value):
+        raise ValueError('Invalid persistent ID: %r' % (value,))
+    return '%016X' % int(value, 16)
+
+
+def columns(value):
+    names = [name.strip() for name in value.split(',') if name.strip()]
+    unknown = [name for name in names if name not in FIELDS]
+    if unknown:
+        raise argparse.ArgumentTypeError('unknown field(s): %s (see the fields command)' % ', '.join(unknown))
+    return [name for name in names if name != 'persistent_id']
+
+
+def parse_assignments(items):
+    values = {}
+    for item in items:
+        key, sep, value = item.partition('=')
+        if not sep or key in values:
+            raise ValueError('Use distinct FIELD=VALUE assignments: ' + item)
+        if key not in EDITABLE:
+            raise ValueError('Unknown or read-only field: ' + key)
+        values[key] = value
+    return values
+
+
+def load_jobs(path):
+    jobs = json.loads(path.read_text())
+    if not isinstance(jobs, list) or not jobs:
+        raise ValueError('The edits file must contain a non-empty array')
+    result, seen = [], set()
+    for job in jobs:
+        if not isinstance(job, dict) or set(job) != {'id', 'set'}:
+            raise ValueError('Each edit needs an id and a set object')
+        pid = hex_id(job['id'])
+        if pid in seen or not isinstance(job['set'], dict) or not job['set']:
+            raise ValueError('Duplicate ID or empty/invalid set object: ' + pid)
+        seen.add(pid)
+        result.append((pid, job['set']))
+    return result
+
+
+def warn_missing(pid):
+    print('Warning: persistent ID not found, skipped: ' + pid, file=sys.stderr)
+
+
+def print_fields():
+    width = max(len(field) for field in FIELDS)
+    print('%-*s  %-14s  %s' % (width, 'FIELD', 'TYPE', 'ACCESS'))
+    for field in FIELDS:
+        access = 'edit' if field in EDITABLE else 'read'
+        print('%-*s  %-14s  %s%s' % (width, field, describe(field), access, ' *' if field in INDEXED else ''))
+    print()
+    print('* Apple indexes derived from this field are kept, not rebuilt. An edit can leave sort')
+    print('  order, grouping or smart playlists stale.')
+    print('Filters: text =, !=, ~ (contains), !~; numbers =, !=, >, >=, <, <=; media_type also &.')
+    print('Bool fields accept true/false or 1/0. Numbers accept decimal or 0x hex.')
+    print('media_type names: ' + ', '.join('%s (%d)' % item for item in MEDIA_TYPES.items()) + '.')
+    print('  set accepts names, numbers or signed changes (media_type=-music,+podcast).')
+    print('  --filter media_type=podcast is exact; media_type&podcast means "has the podcast bit".')
+    print('podcast_group links a synced episode to an existing Podcasts-menu group by title.')
+
+
+def print_list(tracks, names, as_json, playlist):
+    names = ['persistent_id', *names]
+    rows = [{name: attribute(t, name, playlist) for name in names} for t in tracks]
+    if as_json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
         return
-    if args.upload and (args.action != 'edit' or args.output):
-        raise ValueError('--upload works only in edit mode and cannot be combined with --output')
-    data = args.input.read_bytes()
-    root, tracks = parse(data)
-    playlist = PodcastPlaylist.load(root)
+    def cell(name, value):
+        return '0x%02X' % value if name == 'media_type' else str(value)
+    table = [[name.upper().replace('_', ' ') for name in names]]
+    table += [[cell(name, row[name]) for name in names] for row in rows]
+    widths = [max(len(line[i]) for line in table) for i in range(len(names) - 1)]
+    for line in table:
+        print('  '.join([value.ljust(width) for value, width in zip(line, widths)] + [line[-1]]))
+
+
+def write_changes(args, data, root, by_id, playlist, jobs, skipped):
+    if args.output and args.output.resolve() == args.input.resolve():
+        raise ValueError('Input and output must differ; use --in-place to replace the input')
     guid = device_guid(args.firewire_id, args.input)
     signature_info = validate_signature(data, guid)
-    by_id = {persistent_id(t): t for t in tracks}
-    requested = {'%016X' % int(x, 16) for x in args.id}
-    missing = sorted(requested - by_id.keys())
-    if missing and args.action != 'edit':
-        raise ValueError('Persistent ID not found: ' + ', '.join(missing))
-    # Edit mode skips missing IDs with a warning so a batch continues.
-    for pid in missing:
-        print('Warning: persistent ID not found, skipped: ' + pid, file=sys.stderr)
-    selected = [t for t in tracks if (not requested or persistent_id(t) in requested)
-                and (args.match is None or args.match.casefold() in get_text(t, 1)[0].casefold())
-                and (not args.podcasts or u32(t.header, 0xD0) in (4, 5))
-                and all(matches_filter(t, condition, playlist) for condition in filters)]
-    if args.action == 'view':
-        if not selected:
-            raise ValueError('No track matched the selection')
-        if len(selected) != 1:
-            raise ValueError('Selection matched %d tracks; use a persistent ID or narrower filters' % len(selected))
-        track = selected[0]
-        details = {field: attribute(track, field, playlist)
-                   for field in ['persistent_id', 'track_id', 'location', 'podcast_group', *TEXT, *NUMBER]}
-        mask = details['media_type']
-        details['media_type_hex'] = '0x%08X' % mask
-        details['media_type_flags'] = [name for name, bits in MEDIA_TYPES.items() if mask & bits == bits]
-        details['media_type_unknown_bits'] = '0x%08X' % (mask & ~sum(MEDIA_TYPES.values()))
-        print(json.dumps(details, ensure_ascii=False, indent=2))
-        return
-    if args.action == 'list':
-        print('PERSISTENT ID     TYPE  TITLE')
-        for t in selected:
-            print('%s  0x%02X  %s' % (persistent_id(t), u32(t.header, 0xD0), get_text(t, 1)[0]))
-        return
-    if args.edits:
-        if args.id or args.match is not None or args.podcasts or args.filter or args.set:
-            raise ValueError('--edits cannot be combined with selectors or --set')
-        jobs = json.loads(args.edits.read_text())
-        if not isinstance(jobs, list):
-            raise ValueError('--edits must contain an array')
-    else:
-        if not (requested or args.match is not None or args.podcasts or filters) or not args.set:
-            raise ValueError('Select tracks with --id, --match, --podcasts or --filter and supply --set')
-        if args.match is not None and len(selected) > 1 and not args.all_matches:
-            raise ValueError('Title match is ambiguous; use an ID or --all-matches')
-        values = {}
-        for item in args.set:
-            key, sep, value = item.partition('=')
-            if not sep or key in values:
-                raise ValueError('Use distinct FIELD=VALUE assignments')
-            values[key] = value
-        jobs = [{'id': persistent_id(t), 'set': values} for t in selected]
-    if not jobs:
-        raise ValueError('No tracks selected')
-    reports, seen = [], set()
-    for job in jobs:
-        if not isinstance(job, dict) or set(job) != {'id', 'set'} or not isinstance(job['id'], str):
-            raise ValueError('Each edit needs a hex string id and a set object')
-        pid = '%016X' % int(job['id'], 16)
-        if pid in seen or not isinstance(job['set'], dict) or not job['set']:
-            raise ValueError('Duplicate ID or empty/invalid set object')
-        seen.add(pid)
+    reports, edited = [], set()
+    for pid, changes in jobs:
         if pid not in by_id:
-            print('Warning: persistent ID not found, skipped: ' + pid, file=sys.stderr)
-            missing.append(pid)
+            warn_missing(pid)
+            skipped.append(pid)
             continue
         track = by_id[pid]
         title = get_text(track, 1)[0]
-        changes = edit_track(track, job['set'], args.experimental, playlist)
-        if changes:
-            reports.append({'id': pid, 'title': title, 'changes': changes})
+        report = edit_track(track, changes, playlist)
+        if report:
+            reports.append({'id': pid, 'title': title, 'changes': report})
+            edited.update(change['field'] for change in report)
     result = root.render()
     if result != data:
         result = sign(result, guid, signature_info)
     parse(result)
+    stale = sorted(edited & INDEXED)
     report = {'input': str(args.input.resolve()), 'source_sha256': hashlib.sha256(data).hexdigest(),
               'result_sha256': hashlib.sha256(result).hexdigest(), 'source_bytes': len(data),
-              'result_bytes': len(result), 'changes': reports, 'skipped_ids': missing,
+              'result_bytes': len(result), 'changes': reports, 'skipped_ids': skipped,
               'finder_tested': False,
-              'note': 'Apple indexes, album tables, preferences and playlists are preserved, except podcast_group links edited here. Text/grouping edits may leave caches stale.'}
-    if args.output:
-        if args.output.resolve() == args.input.resolve():
-            raise ValueError('Input and output must differ')
+              'warnings': ['Apple indexes derived from %s were kept, not rebuilt; sort order, grouping or '
+                           'smart playlists can be stale' % ', '.join(stale)] if stale else []}
+    if args.output or args.in_place:
         if not reports:
-            raise ValueError('No changes; no output written')
+            raise ValueError('No changes; nothing written')
         if args.input.read_bytes() != data:
             raise ValueError('Source changed during edit; retry from a stable copy')
+    if args.output:
         write_exclusive(args.output, result)
         report['output'] = str(args.output.resolve())
-    if args.upload:
-        if not reports:
-            raise ValueError('No changes; database not replaced')
-        if args.input.read_bytes() != data:
-            raise ValueError('Source changed during edit; retry')
-        report['backup'] = str(upload(args.input.resolve(), data, result).resolve())
+    if args.in_place:
+        report['backup'] = str(replace_in_place(args.input.resolve(), data, result).resolve())
         report['output'] = str(args.input.resolve())
     print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+EPILOG = '''\
+examples:
+  %(prog)s list --filter 'artist~Justice' --filter 'year>=2007'
+  %(prog)s list --filter 'media_type&podcast' --columns album,podcast_group
+  %(prog)s show --id A242151529FFD1D0
+  %(prog)s set --id A242151529FFD1D0 'title=Wanta Fanda' rating=80
+  %(prog)s set --filter media_type=5 media_type=podcast --in-place
+  %(prog)s apply edits.json -o candidates/iTunesDB
+
+Selection options combine with AND; repeated --id values combine with OR.
+set and apply only preview changes unless you give -o or --in-place.'''
+
+
+def add_write_options(parser):
+    # A parent parser would drop this group title, so add the group to each command.
+    group = parser.add_argument_group('output (default: preview only)')
+    group.add_argument('--firewire-id', metavar='HEX',
+                       help='Device GUID for signing; read from Device/SysInfo when omitted')
+    exclusive = group.add_mutually_exclusive_group()
+    exclusive.add_argument('-o', '--output', type=Path, metavar='PATH', help='Write the result to a NEW local file')
+    exclusive.add_argument('--in-place', action='store_true',
+                           help='Back up --input to backups/ with a datestamp, then replace it')
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument('--input', type=Path, default=DEFAULT_INPUT, metavar='PATH',
+                        help='iTunesDB to read (default: the mounted iPod)')
+    select = argparse.ArgumentParser(add_help=False)
+    group = select.add_argument_group('selection (all options must match)')
+    group.add_argument('--id', action='append', default=[], type=hex_id, metavar='HEX',
+                       help='Persistent ID shown by list; repeat to select several')
+    group.add_argument('--filter', action='append', default=[], metavar='EXPR',
+                       help="Field comparison, for example 'artist~Justice' or 'year>=2007'; repeatable")
+    group.add_argument('--match', action='append', default=[], metavar='TEXT',
+                       help='Same as --filter title~TEXT')
+
+    parser = argparse.ArgumentParser(description=__doc__, epilog=EPILOG,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest='command', required=True, metavar='COMMAND')
+    commands.add_parser('fields', help='Show the fields that list, show, --filter and set accept')
+    sub = commands.add_parser('list', parents=[common, select], help='Print a table of matching tracks')
+    sub.add_argument('--columns', type=columns, default='media_type,title', metavar='FIELDS',
+                     help='Comma-separated fields to show after the ID (default: media_type,title)')
+    sub.add_argument('--json', action='store_true', help='Print a JSON array instead of a table')
+    commands.add_parser('show', parents=[common, select], help='Print every field of matching tracks as JSON')
+    sub = commands.add_parser('set', parents=[common, select], help='Change fields on matching tracks')
+    sub.add_argument('assignments', nargs='+', metavar='FIELD=VALUE', help='Field to change; see the fields command')
+    add_write_options(sub)
+    sub = commands.add_parser('apply', parents=[common], help='Apply per-track changes from a JSON file')
+    sub.add_argument('edits', type=Path, metavar='EDITS.json', help='Array of {"id": HEX, "set": {FIELD: VALUE}}')
+    add_write_options(sub)
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.command == 'fields':
+        print_fields()
+        return
+    filters = [parse_filter(expression) for expression in getattr(args, 'filter', [])]
+    filters += [parse_filter('title~' + text) for text in getattr(args, 'match', [])]
+    assignments = parse_assignments(args.assignments) if args.command == 'set' else None
+    data = args.input.read_bytes()
+    root, tracks = parse(data)
+    playlist = PodcastPlaylist.load(root)
+    by_id = {persistent_id(t): t for t in tracks}
+    if args.command == 'apply':
+        write_changes(args, data, root, by_id, playlist, load_jobs(args.edits), [])
+        return
+    ids = set(args.id)
+    missing = sorted(ids - by_id.keys())
+    for pid in missing:
+        warn_missing(pid)
+    selected = [t for t in tracks if (not ids or persistent_id(t) in ids)
+                and all(matches_filter(t, condition, playlist) for condition in filters)]
+    if args.command == 'list':
+        print_list(selected, args.columns, args.json, playlist)
+    elif args.command == 'show':
+        print(json.dumps([details(t, playlist) for t in selected], ensure_ascii=False, indent=2))
+    else:
+        if not (ids or filters):
+            raise ValueError('Select tracks with --id, --filter or --match')
+        if not selected:
+            raise ValueError('No track matched the selection')
+        jobs = [(persistent_id(t), assignments) for t in selected]
+        write_changes(args, data, root, by_id, playlist, jobs, missing)
 
 
 if __name__ == '__main__':
