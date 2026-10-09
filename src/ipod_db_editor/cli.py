@@ -10,7 +10,8 @@ import sys
 
 from ipod_db_editor import __doc__ as DESCRIPTION
 from ipod_db_editor.device import DEFAULT_INPUT, device_guid
-from ipod_db_editor.fields import EDITABLE, FIELDS, INDEXED, MEDIA_TYPES, describe
+from ipod_db_editor import ui
+from ipod_db_editor.fields import EDITABLE, FIELDS, INDEXED
 from ipod_db_editor.files import replace_in_place, write_exclusive
 from ipod_db_editor.itunesdb import get_text, parse, persistent_id
 from ipod_db_editor.podcasts import PodcastPlaylist
@@ -61,46 +62,28 @@ def load_jobs(path):
 
 
 def warn_missing(pid):
-    print('Warning: persistent ID not found, skipped: ' + pid, file=sys.stderr)
+    ui.warn('persistent ID not found, skipped: ' + pid)
 
 
-def print_fields():
-    width = max(len(field) for field in FIELDS)
-    print('%-*s  %-14s  %s' % (width, 'FIELD', 'TYPE', 'ACCESS'))
-    for field in FIELDS:
-        access = 'edit' if field in EDITABLE else 'read'
-        print('%-*s  %-14s  %s%s' % (width, field, describe(field), access, ' *' if field in INDEXED else ''))
-    print()
-    print('* Apple indexes derived from this field are kept, not rebuilt. An edit can leave sort')
-    print('  order, grouping or smart playlists stale.')
-    print('Filters: text =, !=, ~ (contains), !~; numbers =, !=, >, >=, <, <=; media_type also &.')
-    print('Bool fields accept true/false or 1/0. Numbers accept decimal or 0x hex.')
-    print('media_type names: ' + ', '.join('%s (%d)' % item for item in MEDIA_TYPES.items()) + '.')
-    print('  set accepts names, numbers or signed changes (media_type=-music,+podcast).')
-    print('  --filter media_type=podcast is exact; media_type&podcast means "has the podcast bit".')
-    print('podcast_group links a synced episode to an existing Podcasts-menu group by title.')
+def print_json(value):
+    print(json.dumps(value, ensure_ascii=False, indent=2))
 
 
-def print_list(tracks, names, as_json, playlist):
+def print_list(tracks, names, as_json, playlist, total):
     names = ['persistent_id', *names]
     rows = [{name: attribute(t, name, playlist) for name in names} for t in tracks]
     if as_json:
-        print(json.dumps(rows, ensure_ascii=False, indent=2))
-        return
-    def cell(name, value):
-        return '0x%02X' % value if name == 'media_type' else str(value)
-    table = [[name.upper().replace('_', ' ') for name in names]]
-    table += [[cell(name, row[name]) for name in names] for row in rows]
-    widths = [max(len(line[i]) for line in table) for i in range(len(names) - 1)]
-    for line in table:
-        print('  '.join([value.ljust(width) for value, width in zip(line, widths)] + [line[-1]]))
+        print_json(rows)
+    else:
+        ui.print_tracks(rows, names, total)
 
 
 def write_changes(args, data, root, by_id, playlist, jobs, skipped):
     if args.output and args.output.resolve() == args.input.resolve():
         raise ValueError('Input and output must differ; use --in-place to replace the input')
-    guid = device_guid(args.firewire_id, data, args.input)
-    signature_info = validate_signature(data, guid)
+    with ui.status('Finding the device GUID...'):
+        guid = device_guid(args.firewire_id, data, args.input)
+        signature_info = validate_signature(data, guid)
     reports, edited = [], set()
     for pid, changes in jobs:
         if pid not in by_id:
@@ -135,7 +118,10 @@ def write_changes(args, data, root, by_id, playlist, jobs, skipped):
     if args.in_place:
         report['backup'] = str(replace_in_place(args.input.resolve(), data, result).resolve())
         report['output'] = str(args.input.resolve())
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if args.json:
+        print_json(report)
+    else:
+        ui.print_report(report)
 
 
 EPILOG = '''\
@@ -183,12 +169,15 @@ def build_parser():
     sub.add_argument('--columns', type=columns, default='media_type,title', metavar='FIELDS',
                      help='Comma-separated fields to show after the ID (default: media_type,title)')
     sub.add_argument('--json', action='store_true', help='Print a JSON array instead of a table')
-    commands.add_parser('show', parents=[common, select], help='Print every field of matching tracks as JSON')
+    sub = commands.add_parser('show', parents=[common, select], help='Print every field of matching tracks')
+    sub.add_argument('--json', action='store_true', help='Print a JSON array instead of panels')
     sub = commands.add_parser('set', parents=[common, select], help='Change fields on matching tracks')
     sub.add_argument('assignments', nargs='+', metavar='FIELD=VALUE', help='Field to change; see the fields command')
+    sub.add_argument('--json', action='store_true', help='Print the change report as JSON')
     add_write_options(sub)
     sub = commands.add_parser('apply', parents=[common], help='Apply per-track changes from a JSON file')
     sub.add_argument('edits', type=Path, metavar='EDITS.json', help='Array of {"id": HEX, "set": {FIELD: VALUE}}')
+    sub.add_argument('--json', action='store_true', help='Print the change report as JSON')
     add_write_options(sub)
     return parser
 
@@ -196,14 +185,15 @@ def build_parser():
 def run(argv=None):
     args = build_parser().parse_args(argv)
     if args.command == 'fields':
-        print_fields()
+        ui.print_fields()
         return
     filters = [parse_filter(expression) for expression in getattr(args, 'filter', [])]
     filters += [parse_filter('title~' + text) for text in getattr(args, 'match', [])]
     assignments = parse_assignments(args.assignments) if args.command == 'set' else None
-    data = args.input.read_bytes()
-    root, tracks = parse(data)
-    playlist = PodcastPlaylist.load(root)
+    with ui.status('Reading %s...' % args.input):
+        data = args.input.read_bytes()
+        root, tracks = parse(data)
+        playlist = PodcastPlaylist.load(root)
     by_id = {persistent_id(t): t for t in tracks}
     if args.command == 'apply':
         write_changes(args, data, root, by_id, playlist, load_jobs(args.edits), [])
@@ -215,9 +205,13 @@ def run(argv=None):
     selected = [t for t in tracks if (not ids or persistent_id(t) in ids)
                 and all(matches_filter(t, condition, playlist) for condition in filters)]
     if args.command == 'list':
-        print_list(selected, args.columns, args.json, playlist)
+        print_list(selected, args.columns, args.json, playlist, len(tracks))
     elif args.command == 'show':
-        print(json.dumps([details(t, playlist) for t in selected], ensure_ascii=False, indent=2))
+        shown = [details(t, playlist) for t in selected]
+        if args.json:
+            print_json(shown)
+        else:
+            ui.print_details(shown)
     else:
         if not (ids or filters):
             raise ValueError('Select tracks with --id, --filter or --match')
@@ -232,5 +226,8 @@ def main():
     try:
         run()
     except (ValueError, OSError, KeyError, struct.error, subprocess.CalledProcessError) as exc:
-        print('Error: ' + str(exc), file=sys.stderr)
+        ui.error(str(exc))
         sys.exit(1)
+    except KeyboardInterrupt:
+        ui.err_console.print('[yellow]Cancelled.[/yellow]')
+        sys.exit(130)

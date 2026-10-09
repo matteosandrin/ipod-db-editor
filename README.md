@@ -2,7 +2,7 @@
 
 Edit track metadata directly in an iPod Classic's `iTunesDB`, without breaking Finder sync.
 
-Requires macOS and Python 3.9+. No other dependencies.
+Requires macOS and Python 3.9+.
 
 ## Install
 
@@ -28,7 +28,7 @@ ipod-db-editor set media_type=music --match "sultans of swing" --in-place   # ap
 | --- | --- |
 | `fields` | List every field and whether it is editable |
 | `list` | Table of matching tracks (`--columns a,b`, `--json`) |
-| `show` | Every field of matching tracks, as JSON |
+| `show` | Every field of matching tracks |
 | `set FIELD=VALUE...` | Change fields on matching tracks |
 | `apply EDITS.json` | Apply different changes per track |
 

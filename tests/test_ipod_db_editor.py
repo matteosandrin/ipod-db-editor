@@ -120,8 +120,8 @@ class MetadataTests(unittest.TestCase):
                 (device / 'SysInfoExtended').unlink()
                 prefs.write_bytes(plistlib.dumps({'Devices': {wrong: {}, GUID.hex().upper(): {}}}))
                 self.assertEqual(device_guid(None, self.data, target), GUID)
-                report = json.loads(self.run_cli(['set', '--input', str(target),
-                                                  '--id', persistent_id(self.tracks[0]), 'rating=80']))
+                report = self.run_json(['set', '--input', str(target),
+                                        '--id', persistent_id(self.tracks[0]), 'rating=80'])
                 self.assertEqual(len(report['changes']), 1)
                 # An explicit flag is used as given, even when a correct GUID can be found.
                 self.assertEqual(device_guid('0x' + wrong, self.data, target), bytes.fromhex(wrong))
@@ -191,12 +191,19 @@ class MetadataTests(unittest.TestCase):
             self.errors = errors.getvalue()
         return stream.getvalue()
 
+    def run_json(self, args):
+        return json.loads(self.run_cli(args + ['--json']))
+
     def test_preview_does_not_change_input(self):
-        output = self.run_cli(['set', '--input', str(BASE), '--firewire-id', GUID.hex(),
-                               '--filter', 'media_type&podcast', 'media_type=podcast'])
-        report = json.loads(output)
+        cli = ['set', '--input', str(BASE), '--firewire-id', GUID.hex(),
+               '--filter', 'media_type&podcast', 'media_type=podcast']
+        report = self.run_json(cli)
         self.assertEqual(len(report['changes']), 4)
         self.assertNotIn('output', report)
+        output = self.run_cli(cli)
+        self.assertIn('Changes (preview)', output)
+        self.assertIn('4 changes on 4 tracks. Nothing written.', output)
+        self.assertIn('Apple indexes derived from media_type', self.errors)
         self.assertEqual(BASE.read_bytes(), self.data)
 
     def test_set_requires_selection_assignments_and_one_output(self):
@@ -216,43 +223,43 @@ class MetadataTests(unittest.TestCase):
         wanted = {persistent_id(t) for t in self.tracks
                   if 'the' in get_text(t, 1)[0].casefold() and t.header[0x1F] != 80}
         self.assertGreater(len(wanted), 1)
-        report = json.loads(self.run_cli(['set', '--input', str(BASE), '--firewire-id', GUID.hex(),
-                                          '--match', 'THE', 'rating=80']))
+        report = self.run_json(['set', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                                '--match', 'THE', 'rating=80'])
         self.assertEqual({c['id'] for c in report['changes']}, wanted)
 
     def test_report_warns_only_for_indexed_fields(self):
         cli = ['set', '--input', str(BASE), '--firewire-id', GUID.hex(), '--id', persistent_id(self.tracks[0])]
-        report = json.loads(self.run_cli(cli + ['rating=80']))
+        report = self.run_json(cli + ['rating=80'])
         self.assertEqual(report['warnings'], [])
-        report = json.loads(self.run_cli(cli + ['title=New', 'rating=80']))
+        report = self.run_json(cli + ['title=New', 'rating=80'])
         self.assertEqual(len(report['warnings']), 1)
         self.assertIn('title', report['warnings'][0])
 
     def test_list_filters_combine_text_numbers_and_flags(self):
         track = next(t for t in self.tracks if u32(t.header, 0xD0) == 5)
         pid = persistent_id(track)
-        output = self.run_cli(['list', '--input', str(BASE),
-                               '--filter', 'title~' + get_text(track, 1)[0].swapcase(),
-                               '--filter', 'media_type&podcast', '--filter', 'year>=0',
-                               '--filter', 'persistent_id=' + pid.lower()])
-        self.assertEqual(len(output.splitlines()), 2)
-        self.assertIn(pid, output)
-        self.assertIn('0x05', output)
-        exact = self.run_cli(['list', '--input', str(BASE), '--filter', 'media_type=podcast'])
-        self.assertEqual(len(exact.splitlines()), 1)
-        includes = self.run_cli(['list', '--input', str(BASE), '--filter', 'media_type&podcast'])
-        self.assertEqual(len(includes.splitlines()), 5)
+        rows = self.run_json(['list', '--input', str(BASE),
+                              '--filter', 'title~' + get_text(track, 1)[0].swapcase(),
+                              '--filter', 'media_type&podcast', '--filter', 'year>=0',
+                              '--filter', 'persistent_id=' + pid.lower()])
+        self.assertEqual([row['persistent_id'] for row in rows], [pid])
+        self.assertEqual(rows[0]['media_type'], 5)
+        exact = self.run_json(['list', '--input', str(BASE), '--filter', 'media_type=podcast'])
+        self.assertEqual(exact, [])
+        includes = self.run_json(['list', '--input', str(BASE), '--filter', 'media_type&podcast'])
+        self.assertEqual(len(includes), 4)
         self.assertEqual(BASE.read_bytes(), self.data)
 
     def test_list_columns_and_json(self):
         track = self.tracks[0]
         pid = persistent_id(track)
         cli = ['list', '--input', str(BASE), '--id', pid, '--columns', 'artist,year,persistent_id']
-        lines = self.run_cli(cli).splitlines()
-        self.assertEqual(lines[0].split(), ['PERSISTENT', 'ID', 'ARTIST', 'YEAR'])
-        self.assertTrue(lines[1].startswith(pid))
-        self.assertTrue(lines[1].endswith(str(attribute(track, 'year'))))
-        rows = json.loads(self.run_cli(cli + ['--json']))
+        # The table shows one row of cells between the box lines.
+        lines = [[cell.strip() for cell in line.strip('┃│').split(line[0])]
+                 for line in self.run_cli(cli).splitlines() if line[:1] in '┃│']
+        self.assertEqual(lines[0], ['Persistent ID', 'Artist', 'Year'])
+        self.assertEqual(lines[1], [pid, get_text(track, 4)[0], str(attribute(track, 'year'))])
+        rows = self.run_json(cli)
         self.assertEqual(rows, [{'persistent_id': pid, 'artist': get_text(track, 4)[0],
                                  'year': attribute(track, 'year')}])
         with self.assertRaises(SystemExit):
@@ -286,7 +293,7 @@ class MetadataTests(unittest.TestCase):
         self.assertGreater(len(wanted), 1)
         with tempfile.TemporaryDirectory() as folder:
             out = Path(folder) / 'candidate'
-            report = json.loads(self.run_cli([*cli, '--filter', 'media_type=5', 'media_type=4', '-o', str(out)]))
+            report = self.run_json([*cli, '--filter', 'media_type=5', 'media_type=4', '-o', str(out)])
             self.assertEqual({c['id'] for c in report['changes']}, wanted)
             _, tracks = parse(out.read_bytes())
             for track in tracks:
@@ -301,7 +308,7 @@ class MetadataTests(unittest.TestCase):
     def test_show_track_fields_and_combined_media_flags(self):
         track = next(t for t in self.tracks if u32(t.header, 0xD0) == 5)
         pid = persistent_id(track)
-        shown = json.loads(self.run_cli(['show', '--input', str(BASE), '--id', pid]))
+        shown = self.run_json(['show', '--input', str(BASE), '--id', pid])
         self.assertEqual(len(shown), 1)
         details = shown[0]
         self.assertEqual(details['persistent_id'], pid)
@@ -314,16 +321,17 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(set(details), set(FIELDS) | {'media_type_hex', 'media_type_flags',
                                                            'media_type_unknown_bits'})
         self.assertEqual(BASE.read_bytes(), self.data)
-        filtered = json.loads(self.run_cli(['show', '--input', str(BASE), '--match', details['title'],
-                                            '--filter', 'media_type&podcast', '--filter', 'persistent_id=' + pid]))
+        filtered = self.run_json(['show', '--input', str(BASE), '--match', details['title'],
+                                  '--filter', 'media_type&podcast', '--filter', 'persistent_id=' + pid])
         self.assertEqual(filtered, [details])
 
     def test_show_prints_every_match_and_rejects_write_options(self):
         cli = ['show', '--input', str(BASE)]
-        self.assertEqual(len(json.loads(self.run_cli(cli))), len(self.tracks))
-        self.assertEqual(len(json.loads(self.run_cli(cli + ['--match', '']))), len(self.tracks))
-        self.assertEqual(json.loads(self.run_cli(cli + ['--match', 'NO SUCH TRACK 999999'])), [])
-        self.assertEqual(json.loads(self.run_cli(cli + ['--id', 'FFFFFFFFFFFFFFFF'])), [])
+        self.assertEqual(len(self.run_json(cli)), len(self.tracks))
+        self.assertEqual(len(self.run_json(cli + ['--match', ''])), len(self.tracks))
+        self.assertEqual(self.run_json(cli + ['--match', 'NO SUCH TRACK 999999']), [])
+        self.assertEqual(self.run_json(cli + ['--id', 'FFFFFFFFFFFFFFFF']), [])
+        self.assertIn('No tracks matched', self.run_cli(cli + ['--id', 'FFFFFFFFFFFFFFFF']))
         self.assertIn('FFFFFFFFFFFFFFFF', self.errors)
         for extra in [['rating=80'], ['-o', '/tmp/unused-candidate'], ['--in-place'],
                       ['--firewire-id', GUID.hex()], ['--id', 'not-hex']]:
@@ -336,8 +344,8 @@ class MetadataTests(unittest.TestCase):
             path = Path(folder) / 'edits.json'
             out = Path(folder) / 'candidate'
             path.write_text(json.dumps([{'id': persistent_id(self.tracks[0]), 'set': {'rating': 80}}]))
-            report = json.loads(self.run_cli(['apply', '--input', str(BASE), '--firewire-id', GUID.hex(),
-                                              str(path), '-o', str(out)]))
+            report = self.run_json(['apply', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                                    str(path), '-o', str(out)])
             self.assertEqual(len(report['changes']), 1)
             _, tracks = parse(out.read_bytes())
             self.assertEqual(tracks[0].header[0x1F], 80)
@@ -358,7 +366,7 @@ class MetadataTests(unittest.TestCase):
                 self.run_cli(args + ['-o', str(target)])
             backups = Path(folder) / 'backups'
             with patch('ipod_db_editor.files.BACKUPS', backups):
-                report = json.loads(self.run_cli(args + ['--in-place']))
+                report = self.run_json(args + ['--in-place'])
             backup = Path(report['backup'])
             self.assertEqual(backup.parent, backups.resolve())
             self.assertTrue(backup.name.startswith('iTunesDB.backup-'))
@@ -375,18 +383,18 @@ class MetadataTests(unittest.TestCase):
             path = Path(folder) / 'edits.json'
             path.write_text(json.dumps([{'id': 'FFFFFFFFFFFFFFFF', 'set': {'rating': 80}},
                                         {'id': persistent_id(self.tracks[0]), 'set': {'rating': 80}}]))
-            report = json.loads(self.run_cli(['apply', '--input', str(BASE), '--firewire-id', GUID.hex(),
-                                              str(path)]))
+            report = self.run_json(['apply', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                                    str(path)])
         self.assertEqual(len(report['changes']), 1)
         self.assertEqual(report['skipped_ids'], ['FFFFFFFFFFFFFFFF'])
         self.assertIn('Warning: persistent ID not found, skipped: FFFFFFFFFFFFFFFF', self.errors)
-        report = json.loads(self.run_cli(['set', '--input', str(BASE), '--firewire-id', GUID.hex(),
-                                          '--id', 'FFFFFFFFFFFFFFFF', '--id', persistent_id(self.tracks[0]),
-                                          'rating=80']))
+        report = self.run_json(['set', '--input', str(BASE), '--firewire-id', GUID.hex(),
+                                '--id', 'FFFFFFFFFFFFFFFF', '--id', persistent_id(self.tracks[0]),
+                                'rating=80'])
         self.assertEqual(len(report['changes']), 1)
         self.assertEqual(report['skipped_ids'], ['FFFFFFFFFFFFFFFF'])
         output = self.run_cli(['list', '--input', str(BASE), '--id', 'FFFFFFFFFFFFFFFF'])
-        self.assertEqual(len(output.splitlines()), 1)
+        self.assertIn('No tracks matched', output)
         self.assertIn('FFFFFFFFFFFFFFFF', self.errors)
         with self.assertRaises(ValueError):
             self.run_cli(['set', '--input', str(BASE), '--firewire-id', GUID.hex(),
@@ -404,11 +412,11 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(playlist.group_of(by_title['Vanguard']), 'Acquired')
         self.assertEqual(playlist.group_of(orphan), '')
         cli = ['--input', str(UNLINKED)]
-        unlinked = self.run_cli(['list', *cli, '--filter', 'media_type&podcast', '--filter', 'podcast_group='])
-        self.assertEqual(len(unlinked.splitlines()), 3)
-        self.assertIn(pid, unlinked)
-        self.assertEqual(len(self.run_cli(['list', *cli, '--filter', 'podcast_group=acquired']).splitlines()), 3)
-        self.assertEqual(json.loads(self.run_cli(['show', *cli, '--id', pid]))[0]['podcast_group'], '')
+        unlinked = self.run_json(['list', *cli, '--filter', 'media_type&podcast', '--filter', 'podcast_group='])
+        self.assertEqual(len(unlinked), 2)
+        self.assertIn(pid, [row['persistent_id'] for row in unlinked])
+        self.assertEqual(len(self.run_json(['list', *cli, '--filter', 'podcast_group=acquired'])), 2)
+        self.assertEqual(self.run_json(['show', *cli, '--id', pid])[0]['podcast_group'], '')
         with self.assertRaises(ValueError):
             edit_track(orphan, {'podcast_group': 'Middlebrow'}, None)
         for value in ['Nope', 1]:
@@ -436,12 +444,12 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(PodcastPlaylist.load(root).group_of(relinked), 'Middlebrow')
         with tempfile.TemporaryDirectory() as folder:
             out = Path(folder) / 'candidate'
-            report = json.loads(self.run_cli(['set', *cli, '--firewire-id', GUID.hex(), '--id', pid,
-                                              'podcast_group=Middlebrow', '-o', str(out)]))
+            report = self.run_json(['set', *cli, '--firewire-id', GUID.hex(), '--id', pid,
+                                    'podcast_group=Middlebrow', '-o', str(out)])
             self.assertEqual(report['changes'][0]['changes'][0]['after'], 'Middlebrow')
             self.assertEqual(report['warnings'], [])
             self.assertEqual(out.read_bytes(), result)
-            details = json.loads(self.run_cli(['show', '--input', str(out), '--id', pid]))[0]
+            details = self.run_json(['show', '--input', str(out), '--id', pid])[0]
             self.assertEqual(details['podcast_group'], 'Middlebrow')
         with self.assertRaises(ValueError):
             self.run_cli(['set', *cli, '--firewire-id', GUID.hex(), '--id', pid, 'podcast_group=Nope'])

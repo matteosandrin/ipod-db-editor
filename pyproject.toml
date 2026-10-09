@@ -8,6 +8,7 @@ dynamic = ["version"]
 description = "Patch track fields in an iPod Classic iTunesDB without rebuilding Apple's database."
 readme = "README.md"
 requires-python = ">=3.9"
+dependencies = ["rich>=13"]
 authors = [{ name = "Matteo Sandrin" }]
 classifiers = [
     "Environment :: Console",
