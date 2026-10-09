@@ -21,7 +21,7 @@ The rules are the same for every command:
 - **Selection** (`list`, `show`, `set`): `--id HEX`, `--filter EXPR` and `--match TEXT` all must match (AND). Repeated `--id` values combine with OR. `--match TEXT` is the same as `--filter 'title~TEXT'`. A missing ID gives a warning, not an error.
 - **Counts never fail a read.** `list` and `show` print all matching tracks, which can be none. Only `set` fails when nothing matches. `set` also needs at least one selector, so it never edits every track by accident.
 - **Writes are explicit.** `set` and `apply` show a preview unless you give `-o PATH` (write a new local file) or `--in-place` (back up, then replace `--input`).
-- **Only writes need the device GUID.** `set` and `apply` read it from an adjacent `Device/SysInfo` or the mounted iPod, or from `--firewire-id HEX`. `list` and `show` do not use it.
+- **Only writes need the device GUID, and it is found automatically.** `set` and `apply` try the GUIDs in `Device/SysInfo` and `Device/SysInfoExtended` (next to `--input` or on the mounted iPod), every iPod in `~/Library/Preferences/com.apple.iPod.plist`, and the USB serial number of any connected iPod. They use the first one that matches the database's HASH58 signature. If none matches, give `--firewire-id HEX`; it is then used as given. `list` and `show` do not use it.
 
 ## Find tracks
 
@@ -67,7 +67,6 @@ Unknown fields or invalid operators fail with an error before the database is re
 ```sh
 python3 ipod_db_editor.py set \
   --input evidence/before-edits.iTunesDB \
-  --firewire-id 000A27002503D1F0 \
   --id A242151529FFD1D0 \
   'title=Wanta Fanda' rating=80 remember_position=true \
   -o candidates/renamed.iTunesDB
@@ -108,7 +107,6 @@ python3 ipod_db_editor.py list --filter 'media_type&podcast' --filter 'podcast_g
 
 python3 ipod_db_editor.py set \
   --input evidence/unlinked-groups.iTunesDB \
-  --firewire-id 000A27002503D1F0 \
   --id 5F413F281B4090BF \
   podcast_group=Middlebrow \
   -o candidates/relinked.iTunesDB
@@ -136,7 +134,6 @@ For different changes on each track, save a JSON file:
 ```sh
 python3 ipod_db_editor.py apply edits.json \
   --input evidence/before-edits.iTunesDB \
-  --firewire-id 000A27002503D1F0 \
   -o candidates/bulk-edited.iTunesDB
 ```
 
@@ -163,6 +160,6 @@ For the existing warning, the useful controlled sequence is: confirm Finder acce
 
 ## Validation
 
-Run `python3 -m unittest -v test_ipod_db_editor` from this folder. The 25 tests use the saved evidence and local temporary files, without writing to the iPod. They cover exact no-op round trips and signatures for all four copies, four-byte-only podcast changes, Unicode string growth/shrink, preservation of unrelated records, adding missing text, scalar edits, podcast group links, malformed data, incorrect GUIDs, filters and selection, list columns, stale-index warnings, exclusive output, in-place replacement with backups and JSON batches.
+Run `python3 -m unittest -v test_ipod_db_editor` from this folder. The 26 tests use the saved evidence and local temporary files, without writing to the iPod. They cover exact no-op round trips and signatures for all four copies, four-byte-only podcast changes, Unicode string growth/shrink, preservation of unrelated records, adding missing text, scalar edits, podcast group links, malformed data, incorrect GUIDs, automatic GUID lookup, filters and selection, list columns, stale-index warnings, exclusive output, in-place replacement with backups and JSON batches.
 
 HASH58 is implemented with the libgpod-documented key derivation. HASH72 retains the original signature's IV/random bytes and recomputes its digest/encryption using OpenSSL; it does not create a new device identity. The tests confirm that signing an unmodified source produces its exact original bytes. Apple's private database validation has not been reproduced.

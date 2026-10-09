@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import plistlib
 import struct
 import sys
 import tempfile
@@ -90,6 +91,42 @@ class MetadataTests(unittest.TestCase):
         broken[-1] ^= 1
         with self.assertRaises(ValueError):
             edit.validate_signature(broken, GUID)
+
+    def test_guid_found_without_flag(self):
+        # Each source also gives a wrong GUID, so the HASH58 check must select the right one.
+        wrong = '0000000000000001'
+        with tempfile.TemporaryDirectory() as folder:
+            prefs = Path(folder) / 'com.apple.iPod.plist'
+            device = Path(folder) / 'iPod_Control' / 'Device'
+            target = Path(folder) / 'iPod_Control' / 'iTunes' / 'iTunesDB'
+            device.mkdir(parents=True)
+            target.parent.mkdir()
+            target.write_bytes(self.data)
+            (device / 'SysInfo').write_text('FirewireGuid: 0x%s\n' % wrong)
+            usb = []
+            with patch.object(edit, 'IPOD_PREFS', prefs), patch.object(edit, 'DEFAULT_INPUT', target), \
+                    patch.object(edit, 'usb_serial_numbers', lambda: usb):
+                with self.assertRaisesRegex(ValueError, '--firewire-id'):
+                    edit.device_guid(None, self.data, target)
+                usb[:] = [wrong, GUID.hex().upper()]
+                self.assertEqual(edit.device_guid(None, self.data, target), GUID)
+                usb.clear()
+                (device / 'SysInfoExtended').write_bytes(plistlib.dumps({'FireWireGUID': GUID.hex()}))
+                self.assertEqual(edit.device_guid(None, self.data, target), GUID)
+                (device / 'SysInfoExtended').unlink()
+                prefs.write_bytes(plistlib.dumps({'Devices': {wrong: {}, GUID.hex().upper(): {}}}))
+                self.assertEqual(edit.device_guid(None, self.data, target), GUID)
+                report = json.loads(self.run_cli(['set', '--input', str(target),
+                                                  '--id', edit.persistent_id(self.tracks[0]), 'rating=80']))
+                self.assertEqual(len(report['changes']), 1)
+                # An explicit flag is used as given, even when a correct GUID can be found.
+                self.assertEqual(edit.device_guid('0x' + wrong, self.data, target), bytes.fromhex(wrong))
+                with self.assertRaises(ValueError):
+                    self.run_cli(['set', '--input', str(target), '--firewire-id', wrong,
+                                  '--id', edit.persistent_id(self.tracks[0]), 'rating=80'])
+                for bad in ['zz' * 8, 'ABC']:
+                    with self.assertRaises(ValueError, msg=bad):
+                        edit.device_guid(bad, self.data, target)
 
     def test_bad_lengths_and_counts_rejected(self):
         for offset, value in [(8, len(self.data) - 1), (20, 0xFFFFFFFF), (4, len(self.data) + 1), (16, 1)]:

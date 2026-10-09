@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import struct
 import subprocess
@@ -47,6 +48,8 @@ FIELDS = READ_ONLY + EDITABLE
 AES_KEY = '618ca10dc7f57fd3b4723e08157463d7'
 BACKUPS = Path(__file__).resolve().parent / 'backups'
 DEFAULT_INPUT = Path('/Volumes/iPod/iPod_Control/iTunes/iTunesDB')
+# macOS records each connected iPod here, keyed by its FireWire GUID.
+IPOD_PREFS = Path.home() / 'Library/Preferences/com.apple.iPod.plist'
 
 
 def u32(data, offset):
@@ -358,21 +361,60 @@ def sign(data, guid, signature_info):
     return bytes(result)
 
 
-def device_guid(value, source):
-    if value is None:
-        candidates = [source.parent.parent / 'Device' / 'SysInfo', DEFAULT_INPUT.parent.parent / 'Device' / 'SysInfo']
-        for path in candidates:
-            if path.is_file():
-                match = re.search(r'FirewireGuid\s*:\s*(?:0x)?([0-9a-fA-F]{16})', path.read_text())
-                if match:
-                    value = match.group(1)
-                    break
-    if value is None:
-        raise ValueError('Supply --firewire-id with the device GUID from Device/SysInfo')
-    result = bytes.fromhex(value.removeprefix('0x'))
+def read_plist(path):
+    try:
+        return plistlib.loads(path.read_bytes())
+    except (OSError, plistlib.InvalidFileException):
+        return {}
+
+
+def usb_serial_numbers():
+    # A connected iPod uses its FireWire GUID as the USB serial number.
+    try:
+        output = subprocess.run(['/usr/sbin/ioreg', '-p', 'IOUSB', '-l', '-w0'],
+                                capture_output=True, text=True).stdout
+    except OSError:
+        return []
+    return re.findall(r'"USB Serial Number" = "([0-9a-fA-F]{16})"', output)
+
+
+def guid_candidates(source):
+    # Yield possible GUIDs, local files first. The caller checks each against HASH58.
+    for device in [source.parent.parent / 'Device', DEFAULT_INPUT.parent.parent / 'Device']:
+        if (device / 'SysInfo').is_file():
+            yield from re.findall(r'FirewireGuid\s*:\s*(?:0x)?([0-9a-fA-F]{16})',
+                                  (device / 'SysInfo').read_text(errors='replace'))
+        if (device / 'SysInfoExtended').is_file():
+            yield str(read_plist(device / 'SysInfoExtended').get('FireWireGUID', ''))
+    if IPOD_PREFS.is_file():
+        yield from read_plist(IPOD_PREFS).get('Devices', {})
+    yield from usb_serial_numbers()
+
+
+def parse_guid(value):
+    try:
+        result = bytes.fromhex(value.removeprefix('0x'))
+    except ValueError:
+        result = b''
     if len(result) != 8:
         raise ValueError('FireWire ID must contain 16 hex digits')
     return result
+
+
+def device_guid(value, data, source):
+    if value is not None:
+        return parse_guid(value)
+    tried = set()
+    for candidate in guid_candidates(source):
+        try:
+            guid = parse_guid(candidate)
+        except ValueError:
+            continue
+        if guid not in tried and hash58(data, guid) == data[88:108]:
+            return guid
+        tried.add(guid)
+    raise ValueError('No known device GUID matches this database (tried %d). Connect the iPod, '
+                     'or supply --firewire-id with its USB serial number' % len(tried))
 
 
 def integer(value):
@@ -637,7 +679,7 @@ def print_list(tracks, names, as_json, playlist):
 def write_changes(args, data, root, by_id, playlist, jobs, skipped):
     if args.output and args.output.resolve() == args.input.resolve():
         raise ValueError('Input and output must differ; use --in-place to replace the input')
-    guid = device_guid(args.firewire_id, args.input)
+    guid = device_guid(args.firewire_id, data, args.input)
     signature_info = validate_signature(data, guid)
     reports, edited = [], set()
     for pid, changes in jobs:
@@ -693,7 +735,7 @@ def add_write_options(parser):
     # A parent parser would drop this group title, so add the group to each command.
     group = parser.add_argument_group('output (default: preview only)')
     group.add_argument('--firewire-id', metavar='HEX',
-                       help='Device GUID for signing; read from Device/SysInfo when omitted')
+                       help='Device GUID for signing; found automatically when omitted')
     exclusive = group.add_mutually_exclusive_group()
     exclusive.add_argument('-o', '--output', type=Path, metavar='PATH', help='Write the result to a NEW local file')
     exclusive.add_argument('--in-place', action='store_true',
