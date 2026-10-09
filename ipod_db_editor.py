@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Patch track fields without rebuilding Apple's database. Python 3.9+ / macOS."""
 import argparse
+from datetime import datetime
 import hashlib
 import hmac
 import json
@@ -39,6 +40,7 @@ MEDIA_TYPES = {
 # These edits can affect indexes, grouping, or other records kept by Apple.
 EXPERIMENTAL = set(TEXT) | {'track_number', 'disc_number', 'media_type', 'podcast_group'}
 AES_KEY = '618ca10dc7f57fd3b4723e08157463d7'
+BACKUPS = Path(__file__).resolve().parent / 'backups'
 
 
 def u32(data, offset):
@@ -505,10 +507,26 @@ def write_exclusive(path, data):
     if path == Path('/Volumes') or Path('/Volumes') in path.parents:
         raise ValueError('Output must be a local candidate, not a mounted device')
     path.parent.mkdir(parents=True, exist_ok=True)
+    write_new(path, data)
+
+
+def write_new(path, data):
     with path.open('xb') as file:
         file.write(data)
         file.flush()
         os.fsync(file.fileno())
+
+
+def upload(path, original, result):
+    # Keep a dated copy of the original on the Mac, then swap in the result atomically.
+    backup = BACKUPS / (path.name + '.backup-' + datetime.now().strftime('%Y%m%d-%H%M%S'))
+    write_exclusive(backup, original)
+    if backup.read_bytes() != original:
+        raise ValueError('Backup verification failed; the database was not changed')
+    temp = path.with_name(path.name + '.upload-tmp')
+    write_new(temp, result)
+    os.replace(temp, path)
+    return backup
 
 
 def main():
@@ -516,22 +534,22 @@ def main():
     parser.add_argument('action', choices=['list', 'view', 'edit', 'fields'])
     parser.add_argument('--input', type=Path, default=Path('/Volumes/iPod/iPod_Control/iTunes/iTunesDB'))
     parser.add_argument('--output', type=Path, help='Write a NEW local file; omit for preview')
+    parser.add_argument('--upload', action='store_true',
+                        help='Back up --input to backups/ with a datestamp, then replace it with the edited database')
     parser.add_argument('--firewire-id')
     parser.add_argument('--id', action='append', default=[], help='Persistent hex ID shown by list; repeatable')
     parser.add_argument('--match', help='Case-insensitive title substring')
     parser.add_argument('--filter', action='append', default=[], metavar='FIELD=VALUE',
-                        help='List/view: attribute comparison; repeat to require all filters')
+                        help='Attribute comparison; repeat to require all filters')
     parser.add_argument('--podcasts', action='store_true', help='Select all existing audio podcasts')
     parser.add_argument('--all-matches', action='store_true', help='Allow --match to select more than one track')
     parser.add_argument('--set', action='append', default=[], metavar='FIELD=VALUE')
     parser.add_argument('--edits', type=Path, help='JSON array of {id, set} objects; cannot combine with selectors')
     parser.add_argument('--experimental', action='store_true', help='Allow edits that may leave derived indexes stale')
     args = parser.parse_args()
-    if args.filter and args.action not in {'list', 'view'}:
-        raise ValueError('--filter is supported in list and view modes only')
     if args.action == 'view':
-        if args.set or args.edits or args.output:
-            raise ValueError('view is read-only; --set, --edits and --output are not supported')
+        if args.set or args.edits or args.output or args.upload:
+            raise ValueError('view is read-only; --set, --edits, --output and --upload are not supported')
         if not (args.id or args.match is not None or args.filter or args.podcasts):
             raise ValueError('Select one track with --id, --match or --filter')
     filters = [parse_filter(value) for value in args.filter]
@@ -540,10 +558,12 @@ def main():
         print('Media types: ' + ', '.join(MEDIA_TYPES))
         print('media_type accepts a number, comma-separated names, or signed flags: -music,+podcast')
         print('Text: ' + ', '.join(TEXT))
-        print('Additional list/view attributes: track_id, persistent_id, location, podcast_group')
+        print('Additional filter/view attributes: track_id, persistent_id, location, podcast_group')
         print('podcast_group links a synced episode to an existing Podcasts-menu group header by title')
         print('Experimental: ' + ', '.join(sorted(EXPERIMENTAL)))
         return
+    if args.upload and (args.action != 'edit' or args.output):
+        raise ValueError('--upload works only in edit mode and cannot be combined with --output')
     data = args.input.read_bytes()
     root, tracks = parse(data)
     playlist = PodcastPlaylist.load(root)
@@ -581,14 +601,14 @@ def main():
             print('%s  0x%02X  %s' % (persistent_id(t), u32(t.header, 0xD0), get_text(t, 1)[0]))
         return
     if args.edits:
-        if args.id or args.match is not None or args.podcasts or args.set:
+        if args.id or args.match is not None or args.podcasts or args.filter or args.set:
             raise ValueError('--edits cannot be combined with selectors or --set')
         jobs = json.loads(args.edits.read_text())
         if not isinstance(jobs, list):
             raise ValueError('--edits must contain an array')
     else:
-        if not (requested or args.match is not None or args.podcasts) or not args.set:
-            raise ValueError('Select tracks with --id, --match or --podcasts and supply --set')
+        if not (requested or args.match is not None or args.podcasts or filters) or not args.set:
+            raise ValueError('Select tracks with --id, --match, --podcasts or --filter and supply --set')
         if args.match is not None and len(selected) > 1 and not args.all_matches:
             raise ValueError('Title match is ambiguous; use an ID or --all-matches')
         values = {}
@@ -635,6 +655,13 @@ def main():
             raise ValueError('Source changed during edit; retry from a stable copy')
         write_exclusive(args.output, result)
         report['output'] = str(args.output.resolve())
+    if args.upload:
+        if not reports:
+            raise ValueError('No changes; database not replaced')
+        if args.input.read_bytes() != data:
+            raise ValueError('Source changed during edit; retry')
+        report['backup'] = str(upload(args.input.resolve(), data, result).resolve())
+        report['output'] = str(args.input.resolve())
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

@@ -27,7 +27,7 @@ python3 ipod_db_editor.py view \
 
 You can select by `--match` or repeatable `--filter` options instead. For example, replace `--id ...` with `--match 'Wanta Fanda'` when reading the edited candidate. Exactly one track must match; zero or multiple matches produce an error. `--all-matches` does not bypass this requirement. `view` is read-only and rejects editing/output options.
 
-## Filter by attributes in list mode
+## Filter by attributes
 
 Use repeatable `--filter` options for any supported text or numeric field, plus `track_id`, `persistent_id` and `location`. All filters must match (AND), including existing `--id`, `--match` and `--podcasts` selectors.
 
@@ -43,7 +43,20 @@ python3 ipod_db_editor.py list \
 - Media types: `--filter 'media_type=podcast'` matches exactly `0x04`; `--filter 'media_type&podcast'` matches any track with the podcast bit, including music+podcast and video+podcast. Comma-separated names work too; `&` requires all specified bits. Signed edit operations are not allowed in filters.
 - Quote expressions so the shell does not interpret `<`, `>` or `&`. Text after the operator is literal, including spaces and equals signs.
 
-Filters only select rows; they do not modify the database. They are supported in `list` and `view` modes. Use `fields` to see the available attributes. Unknown fields or invalid operators fail with an error, even if there would be no matching tracks.
+Filters only select tracks; they do not modify the database by themselves. They work in `list`, `view` and `edit` modes. Use `fields` to see the available attributes.
+
+In `edit` mode, `--set` applies to every track that matches all filters. `--all-matches` is not needed. Run `list` with the same filters first to examine the selection, and omit `--output` to preview the changes:
+
+```sh
+python3 ipod_db_editor.py edit \
+  --firewire-id 000A27002503D1F0 \
+  --filter 'media_type=5' \
+  --set 'media_type=4' \
+  --experimental \
+  --output candidates/iTunesDB
+```
+
+`--filter` cannot be combined with `--edits`. If no track matches, the command fails. Unknown fields or invalid operators fail with an error, even if there would be no matching tracks.
 
 ## Edit a title
 
@@ -142,14 +155,25 @@ python3 ipod_db_editor.py edit \
 
 An edit run prints a JSON change report with source/result SHA256 hashes. Redirect stdout to a separate report file if desired.
 
+To write the result directly to the iPod, use `--upload` instead of `--output`. It copies the current database to `backups/iTunesDB.backup-YYYYMMDD-HHMMSS` in this folder on the Mac (never on the iPod), then replaces `--input` with the edited database. The report includes the backup path. `--upload` fails if there are no changes, and it cannot be combined with `--output`:
+
+```sh
+python3 ipod_db_editor.py edit \
+  --firewire-id 000A27002503D1F0 \
+  --filter 'media_type=5' \
+  --set 'media_type=4' \
+  --experimental \
+  --upload
+```
+
 ## Installing and testing
 
-The script creates local candidates only. Installing one means replacing `iPod_Control/iTunes/iTunesDB` on the mounted device, which is a separate operation. First preserve the current database and matching preferences outside the iPod, and make sure neither Finder nor iOpenPod is syncing. Eject and reconnect after installation to test Finder acceptance.
+Without `--upload`, the script creates local candidates only. Installing one manually means replacing `iPod_Control/iTunes/iTunesDB` on the mounted device, which is a separate operation. First preserve the current database and matching preferences outside the iPod, and make sure neither Finder nor iOpenPod is syncing. Eject and reconnect after installation to test Finder acceptance.
 
 For the existing warning, the useful controlled sequence is: confirm Finder accepts the untouched pre-edit baseline with its matching saved preferences; then test the podcast-only candidate; then try broader metadata edits one at a time. Do not substitute a factory restore for these tests. Start future edits from a Finder-accepted database. Apple syncing can overwrite device-side metadata using the Mac library, so make the corresponding source-library change where possible if it must persist.
 
 ## Validation
 
-Run `python3 -m unittest -v test_ipod_db_editor` from this folder. The 20 tests use the saved evidence and local temporary files, without writing to the iPod. They cover exact no-op round trips and signatures for all four copies, four-byte-only podcast changes, Unicode string growth/shrink, preservation of unrelated records, adding missing text, scalar edits, podcast group links, malformed data, incorrect GUIDs, ambiguous matches, exclusive output and JSON batches.
+Run `python3 -m unittest -v test_ipod_db_editor` from this folder. The 22 tests use the saved evidence and local temporary files, without writing to the iPod. They cover exact no-op round trips and signatures for all four copies, four-byte-only podcast changes, Unicode string growth/shrink, preservation of unrelated records, adding missing text, scalar edits, podcast group links, malformed data, incorrect GUIDs, ambiguous matches, exclusive output, uploads with backups and JSON batches.
 
 HASH58 is implemented with the libgpod-documented key derivation. HASH72 retains the original signature's IV/random bytes and recomputes its digest/encryption using OpenSSL; it does not create a new device identity. The tests confirm that signing an unmodified source produces its exact original bytes. Apple's private database validation has not been reproduced.

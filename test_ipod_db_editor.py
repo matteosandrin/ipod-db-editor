@@ -193,15 +193,34 @@ class MetadataTests(unittest.TestCase):
         missing = next(t for t in self.tracks if edit.get_text(t, 8)[1] is None)
         self.assertTrue(edit.matches_filter(missing, edit.parse_filter('comment=')))
 
-    def test_invalid_filters_and_edit_mode_rejected(self):
+    def test_invalid_filters_rejected(self):
         for expression in ['title', 'unknown=x', 'year~20', 'title>abc', 'rating=nope',
                            'rating&1', 'media_type=-music', 'media_type=unknown']:
             with self.assertRaises(ValueError, msg=expression):
                 edit.parse_filter(expression)
         with self.assertRaises(ValueError):
-            self.run_cli(['edit', '--filter', 'title~anything'])
-        with self.assertRaises(ValueError):
             self.run_cli(['list', '--input', '/nonexistent', '--filter', 'unknown=x'])
+
+    def test_edit_selects_tracks_by_filter(self):
+        cli = ['edit', '--input', str(BASE), '--firewire-id', GUID.hex()]
+        wanted = {edit.persistent_id(t) for t in self.tracks if edit.u32(t.header, 0xD0) == 5}
+        self.assertGreater(len(wanted), 1)
+        with tempfile.TemporaryDirectory() as folder:
+            out = Path(folder) / 'candidate'
+            report = json.loads(self.run_cli([*cli, '--filter', 'media_type=5', '--set', 'media_type=4',
+                                             '--experimental', '--output', str(out)]))
+            self.assertEqual({c['id'] for c in report['changes']}, wanted)
+            _, tracks = edit.parse(out.read_bytes())
+            for track in tracks:
+                if edit.persistent_id(track) in wanted:
+                    self.assertEqual(edit.u32(track.header, 0xD0), 4)
+        with self.assertRaises(ValueError):
+            self.run_cli([*cli, '--filter', 'media_type=5'])
+        with self.assertRaises(ValueError):
+            self.run_cli([*cli, '--filter', 'title=no such title', '--set', 'rating=80'])
+        with self.assertRaises(ValueError):
+            self.run_cli([*cli, '--filter', 'media_type=5', '--edits', 'edits.json'])
+        self.assertEqual(BASE.read_bytes(), self.data)
 
     def test_view_track_fields_and_combined_media_flags(self):
         track = next(t for t in self.tracks if edit.u32(t.header, 0xD0) == 5)
@@ -227,6 +246,7 @@ class MetadataTests(unittest.TestCase):
                           ['--id', 'FFFFFFFFFFFFFFFF'], ['--match', '', '--all-matches'],
                           ['--match', '', '--set', 'rating=80'],
                           ['--match', '', '--output', '/tmp/unused-candidate'],
+                          ['--match', '', '--upload'],
                           ['--match', '', '--edits', '/tmp/unused-edits']]:
             with self.assertRaises(ValueError, msg=str(selection)):
                 self.run_cli(['view', '--input', str(BASE), '--firewire-id', GUID.hex()] + selection)
@@ -243,6 +263,28 @@ class MetadataTests(unittest.TestCase):
             _, tracks = edit.parse(out.read_bytes())
             self.assertEqual(tracks[0].header[0x1F], 80)
             self.assertEqual(BASE.read_bytes(), self.data)
+
+    def test_upload_backs_up_and_replaces_input(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / 'iTunesDB'
+            target.write_bytes(self.data)
+            args = ['edit', '--input', str(target), '--firewire-id', GUID.hex(),
+                    '--id', edit.persistent_id(self.tracks[0]), '--set', 'rating=80']
+            with self.assertRaises(ValueError):
+                self.run_cli(args + ['--upload', '--output', str(Path(folder) / 'other')])
+            backups = Path(folder) / 'backups'
+            with patch.object(edit, 'BACKUPS', backups):
+                report = json.loads(self.run_cli(args + ['--upload']))
+            backup = Path(report['backup'])
+            self.assertEqual(backup.parent, backups.resolve())
+            self.assertTrue(backup.name.startswith('iTunesDB.backup-'))
+            self.assertEqual(backup.read_bytes(), self.data)
+            _, tracks = edit.parse(target.read_bytes())
+            self.assertEqual(tracks[0].header[0x1F], 80)
+            self.assertEqual(sorted(p.name for p in Path(folder).iterdir()), ['backups', 'iTunesDB'])
+            self.assertEqual([p.name for p in backups.iterdir()], [backup.name])
+            with self.assertRaises(ValueError):
+                self.run_cli(args + ['--upload'])
 
     def test_edit_warns_and_skips_missing_ids(self):
         errors = io.StringIO()
