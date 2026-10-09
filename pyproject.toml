@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ipod-db-editor"
+dynamic = ["version"]
+description = "Patch track fields in an iPod Classic iTunesDB without rebuilding Apple's database."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Matteo Sandrin" }]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+
+[project.scripts]
+ipod-db-editor = "ipod_db_editor.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "ipod_db_editor.__version__" }
